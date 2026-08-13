@@ -115,174 +115,11 @@ def generate_pdf_from_step(step_file_path: str, user_id: str) -> Dict[str, Any]:
         }
 
 
-def generate_json_from_step(step_file_path: str, user_id: str, metadata_path: str = None) -> Dict[str, Any]:
-    """
-    Generate JSON from STEP file using step_converter.
-    Saves JSON to the same directory as the STEP file.
-    
-    Args:
-        step_file_path: Path to STEP file
-        user_id: User ID for naming
-        metadata_path: Optional path to metadata JSON file with threaded holes info
-    """
-    try:
-        print(f"Generating JSON from STEP file: {step_file_path} for user: {user_id}")
-        if metadata_path:
-            print(f"Using metadata file: {metadata_path}")
-
-        # Use same directory as STEP file for output
-        step_path = Path(step_file_path)
-        output_dir = step_path.parent
-        # Use standardized naming: {user_id}.json
-        json_dest = output_dir / f"{user_id}.json"
-
-        # Create script to run step_converter with optional metadata
-        # If metadata_path is provided, pass it as 3rd argument
-        if metadata_path and os.path.exists(metadata_path):
-            converter_script = f"""
-import sys
-sys.path.append('/app/src/core')
-from step_converter import OnShapeJSONConverter
-
-converter = OnShapeJSONConverter()
-success = converter.convert('{step_file_path}', '{json_dest}', '{metadata_path}')
-if success:
-    print("JSON conversion completed successfully!")
-else:
-    print("JSON conversion failed!")
-    sys.exit(1)
-"""
-            print(f"[Worker] Using metadata file for threaded holes enrichment")
-        else:
-            converter_script = f"""
-import sys
-sys.path.append('/app/src/core')
-from step_converter import OnShapeJSONConverter
-
-converter = OnShapeJSONConverter()
-success = converter.convert('{step_file_path}', '{json_dest}')
-if success:
-    print("JSON conversion completed successfully!")
-else:
-    print("JSON conversion failed!")
-    sys.exit(1)
-"""
-
-        # Save temporary script in output directory
-        script_path = output_dir / f"converter_{user_id}.py"
-        with open(script_path, 'w') as f:
-            f.write(converter_script)
-
-        # Run script with freecadcmd (increased timeout for heavy files)
-        print(f"Running JSON converter script: {script_path}")
-        result = subprocess.run(
-            ["freecadcmd", str(script_path)],
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minutes timeout
-        )
-
-        # Cleanup script
-        try:
-            os.remove(script_path)
-        except:
-            pass
-
-        if result.returncode != 0:
-            # Extract specific FreeCAD exception from output
-            specific_exception = _extract_freecad_exception(result.stdout or "", result.stderr or "")
-
-            if specific_exception:
-                error_msg = f"Failed to generate JSON file: {specific_exception}"
-            else:
-                error_msg = f"Failed to generate JSON file: FreeCAD command failed with return code {result.returncode}"
-                if result.stderr:
-                    error_msg += f" - {result.stderr[:500]}"  # Limit error message length
-
-            print(f"JSON generation failed: {error_msg}")
-            print(f"FreeCAD stdout: {result.stdout[:500] if result.stdout else 'No output'}")
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "specific_exception": specific_exception,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
-
-        if json_dest.exists():
-            print(f"JSON file created successfully: {json_dest}")
-            return {
-                "status": "success",
-                "json_path": str(json_dest),
-                "filename": json_dest.name,
-                "message": "JSON conversion completed successfully"
-            }
-        else:
-            # Extract specific FreeCAD exception from output even if returncode was 0
-            specific_exception = _extract_freecad_exception(result.stdout or "", result.stderr or "")
-
-            if specific_exception:
-                error_msg = f"Failed to generate JSON file: {specific_exception}"
-            else:
-                error_msg = f"Failed to generate JSON file: JSON file was not created at {json_dest}"
-
-            print(f"JSON generation failed: {error_msg}")
-            if result.stdout:
-                print(f"FreeCAD stdout: {result.stdout[:500]}")
-            if result.stderr:
-                print(f"FreeCAD stderr: {result.stderr[:500]}")
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "specific_exception": specific_exception,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            }
-
-    except ImportError as e:
-        print(f"Warning: Step converter not available: {e}")
-        return {
-            "status": "failed",
-            "error": "JSON generation not available - step_converter not found"
-        }
-    except subprocess.TimeoutExpired as e:
-        error_msg = "JSON generation timed out after 10 minutes. This may happen with very large/complex STEP files."
-        print(f"Error generating JSON: {error_msg}")
-        print(f"Exception: {e}")
-        # Cleanup script on timeout
-        try:
-            step_path = Path(step_file_path)
-            output_dir = step_path.parent
-            script_path = output_dir / f"converter_{user_id}.py"
-            if script_path.exists():
-                os.remove(script_path)
-        except:
-            pass
-        return {
-            "status": "failed",
-            "error": error_msg,
-            "exception": str(e),
-        }
-    except Exception as e:
-        error_msg = f"JSON generation failed: {str(e)}"
-        print(f"Error generating JSON: {error_msg}")
-        import traceback
-        tb = traceback.format_exc()
-        print(f"Traceback: {tb}")
-        return {
-            "status": "failed",
-            "error": error_msg,
-            "traceback": tb,
-        }
-
-
-
 def _validate_generated_files(file_paths: List[str]) -> Dict[str, Any]:
     """
     Validate that provided files exist, are readable, and have valid content.
     - Requires size > 0 and basic readability
     - STEP: first line should start with 'ISO-10303'
-    - JSON: must be valid JSON
 
     Returns a dict with:
       {
@@ -333,15 +170,6 @@ def _validate_generated_files(file_paths: List[str]) -> Dict[str, Any]:
                     errors.append(f"Cannot validate STEP file: {file_path} - {e}")
                     continue
 
-            # JSON validation
-            if fext == '.json':
-                try:
-                    with open(p, 'r') as fh:
-                        json.load(fh)
-                except Exception as e:
-                    errors.append(f"Invalid JSON format: {file_path} - {e}")
-                    continue
-
             valid_files.append({
                 "path": str(p),
                 "filename": p.name,
@@ -378,20 +206,18 @@ def _build_fast_wrapper_script(script_path: str) -> str:
        matter the hole shape (R/C/LR/LC) or pitch (U/T/Z) or shape category
        entirely -- so a .brep sibling gets written for anything the template
        can produce, not just the one case this was tested against.
-       step_converter.py's import_step_file() already has a fast path that
-       uses a sibling .brep instead of re-parsing .step (measured 120-430x
-       faster: ~0.65s vs ~75s on a 4428-hole sheet, verified). This does NOT
-       cache anything across two DIFFERENT requests/shapes -- it only avoids
-       parsing the STEP geometry TWICE (once implicitly when exported, once
-       again when step_converter.py reads it back) within this one
-       request's own STEP->JSON round trip.
+       The technical-drawing path (src/utils/techdraw/run_techdraw_final.py)
+       already prefers a sibling .brep over re-parsing .step (measured
+       120-430x faster: ~0.65s vs ~75s on a 4428-hole sheet, verified). This
+       does NOT cache anything across two DIFFERENT requests/shapes -- it only
+       avoids parsing the same STEP geometry twice within this one request.
 
     2. Coarser OBJ mesh: MeshPart.meshFromShape is monkeypatched to floor
        LinearDeflection/AngularDeflection at a coarser value, regardless of
        what the generated script's OBJ-export loop requests. The .obj file
-       is not read by json_viewer.js (confirmed: it builds geometry only
-       from the JSON) so trading its visual fidelity for wall-clock time is
-       safe as far as the 3D JSON viewer is concerned; on a perforated sheet
+       is not read by the 3D viewer (which tessellates the STEP file
+       directly in the browser) so trading its visual fidelity for
+       wall-clock time is safe as far as display is concerned; on a perforated sheet
        the OBJ loop calls meshFromShape once per face (thousands of tiny
        hole side-walls), so this should compound. This patch is likewise
        generic (same canonical footer template for every shape category),
@@ -891,9 +717,9 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
         if len(valid_step) == 0:
             # Build diagnostics
             # OBJ is intentionally NOT required here: nothing downstream (PDF gen,
-            # JSON gen/enrichment, the active json_viewer.js 3D viewer) reads the
-            # .obj file -- it only fed a now-dormant legacy viewer. STEP is the
-            # only hard requirement for the rest of the pipeline to proceed.
+            # the active STEP 3D viewer) reads the .obj file -- it only fed a
+            # now-dormant legacy viewer. STEP is the only hard requirement for
+            # the rest of the pipeline to proceed.
             stdout_tail = (result.stdout or "").splitlines()[-50:]
             stderr_tail = (result.stderr or "").splitlines()[-50:]
             error_hint = _extract_error_hint("\n".join(stdout_tail), "\n".join(stderr_tail))
@@ -1114,14 +940,13 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
             "post_processing",
             status="running",
             progress=70,
-            message=f"Found {len(generated_files)} CAD files, generating PDF and JSON",
+            message=f"Found {len(generated_files)} CAD files, generating PDF",
         )
 
         # Track file generation status for comprehensive reporting
         file_generation_status = {
             "script": {"expected": 1, "generated": 1, "files": [script_path]},  # Script already exists
             "cad": {"expected": 0, "generated": 0, "files": [], "failures": []},
-            "json": {"expected": 0, "generated": 0, "files": [], "failures": []},
             "pdf": {"expected": 0, "generated": 0, "files": [], "failures": []}
         }
 
@@ -1130,12 +955,10 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
         file_generation_status["cad"]["expected"] = len(generated_files)
         file_generation_status["cad"]["generated"] = len(generated_files)
         file_generation_status["cad"]["files"] = [f["filename"] for f in generated_files]
-        file_generation_status["json"]["expected"] = step_file_count
         file_generation_status["pdf"]["expected"] = step_file_count
 
-        # Generate PDF and JSON from STEP files (if any)
+        # Generate PDF from STEP files (if any)
         pdf_files = []
-        json_files = []
         for i, file_info in enumerate(generated_files):
             if file_info["type"] == "step":
                 # Update progress for each file
@@ -1146,40 +969,20 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                     worker_id=worker_id
                 )
                 monitor_tracker.sample(
-                    "generating_pdf_json",
+                    "generating_pdf",
                     status="running",
                     progress=progress,
                     message=f"Processing file {i+1}/{len(generated_files)}: {file_info['filename']}",
                 )
 
-                # Check for metadata file in input directory (needed before
-                # launching the JSON job below)
-                metadata_path = None
-                if user_id and output_dir:
-                    # Metadata should be in storage/{user_id}/input/metadata.json
-                    user_storage_dir = os.path.dirname(output_dir)  # Get parent of output dir
-                    potential_metadata = os.path.join(user_storage_dir, "input", "metadata.json")
-                    if os.path.exists(potential_metadata):
-                        metadata_path = potential_metadata
-                        print(f"[{worker_id}] Found metadata file: {metadata_path}")
-
-                # PDF and JSON generation are independent of each other --
-                # both only need the STEP file on disk. Run them concurrently
-                # instead of sequentially so wall time is roughly
-                # max(pdf_time, json_time) instead of their sum.
-                print(f"[{worker_id}] Generating PDF and JSON concurrently from STEP file: {file_info['path']}")
-                print(f"[WALLCLOCK] PDF+JSON block starting at t={time.perf_counter()-_wall_t0:.2f}s")
-                _wc_mark("pdf_json_block_starting")
+                print(f"[{worker_id}] Generating PDF from STEP file: {file_info['path']}")
+                print(f"[WALLCLOCK] PDF block starting at t={time.perf_counter()-_wall_t0:.2f}s")
+                _wc_mark("pdf_block_starting")
                 _wc_dump()
-                with ThreadPoolExecutor(max_workers=2) as pool:
-                    pdf_future = pool.submit(generate_pdf_from_step, file_info["path"], user_id)
-                    json_future = pool.submit(generate_json_from_step, file_info["path"], user_id, metadata_path)
-                    pdf_result = pdf_future.result()
-                    json_result = json_future.result()
-                print(f"[WALLCLOCK] PDF+JSON block done at t={time.perf_counter()-_wall_t0:.2f}s")
-                _wc_mark("pdf_json_block_done")
+                pdf_result = generate_pdf_from_step(file_info["path"], user_id)
+                print(f"[WALLCLOCK] PDF block done at t={time.perf_counter()-_wall_t0:.2f}s")
+                _wc_mark("pdf_block_done")
                 _wc_events["pdf_result_status"] = pdf_result.get("status")
-                _wc_events["json_result_status"] = json_result.get("status")
                 _wc_dump()
 
                 if pdf_result["status"] == "success":
@@ -1208,44 +1011,15 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                         worker_id=worker_id
                     )
 
-                if json_result["status"] == "success":
-                    json_files.append({
-                        "type": "json",
-                        "path": json_result["json_path"],
-                        "filename": json_result["filename"]
-                    })
-                    file_generation_status["json"]["generated"] += 1
-                    file_generation_status["json"]["files"].append(json_result["filename"])
-                    print(f"[{worker_id}] ✅ JSON generated successfully: {json_result['filename']}")
-                else:
-                    error_msg = json_result.get("error", "Unknown error during JSON generation")
-                    failure_info = {
-                        "step_file": file_info["filename"],
-                        "error": error_msg,
-                        "specific_exception": json_result.get("specific_exception")
-                    }
-                    file_generation_status["json"]["failures"].append(failure_info)
-                    print(f"[{worker_id}] ⚠️ JSON generation failed for {file_info['filename']}: {error_msg}")
-
-                    # Send MQTT message about JSON failure but continue processing
-                    mqtt_manager.publish_status(
-                        user_id, "warning",
-                        f"Failed to generate JSON file: {error_msg}",
-                        json.dumps(failure_info),
-                        worker_id=worker_id
-                    )
-
-        # Combine all files (STEP, OBJ, PDF, JSON)
-        all_files = generated_files + pdf_files + json_files
+        # Combine all files (STEP, OBJ, PDF)
+        all_files = generated_files + pdf_files
 
         # Calculate total expected vs generated files
         total_expected = (file_generation_status["script"]["expected"] +
                          file_generation_status["cad"]["expected"] +
-                         file_generation_status["json"]["expected"] +
                          file_generation_status["pdf"]["expected"])
         total_generated = (file_generation_status["script"]["generated"] +
                           file_generation_status["cad"]["generated"] +
-                          file_generation_status["json"]["generated"] +
                           file_generation_status["pdf"]["generated"])
 
         # Check if all expected files were generated
@@ -1302,13 +1076,6 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
         else:
             # Partial success - some files failed
             failure_summary = []
-
-            if file_generation_status["json"]["failures"]:
-                failure_summary.append(
-                    f"JSON files: {file_generation_status['json']['generated']}/{file_generation_status['json']['expected']} generated"
-                )
-                for failure in file_generation_status["json"]["failures"]:
-                    failure_summary.append(f"  - {failure['step_file']}: {failure['error']}")
 
             if file_generation_status["pdf"]["failures"]:
                 failure_summary.append(

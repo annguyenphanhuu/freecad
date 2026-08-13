@@ -200,7 +200,7 @@ status_response = api.model('StatusResponse', {
 })
 
 file_info = api.model('FileInfo', {
-    'type': fields.String(description='File type', enum=['step', 'obj', 'pdf', 'json']),
+    'type': fields.String(description='File type', enum=['step', 'obj', 'pdf']),
     'path': fields.String(description='File path'),
     'filename': fields.String(description='File name'),
     'download_url': fields.String(description='Download URL (if auto_download is enabled)', required=False),
@@ -904,8 +904,7 @@ class GenerateModel(Resource):
             expected_files = [
                 f"{user_id}.step",
                 f"{user_id}.obj",
-                f"{user_id}.pdf",
-                f"{user_id}.json"
+                f"{user_id}.pdf"
             ]
             
             # Get file sizes for received files
@@ -1074,8 +1073,7 @@ class JobResult(Resource):
             expected_files = [
                 {"type": "step", "filename": f"{user_id}.step"},
                 {"type": "obj", "filename": f"{user_id}.obj"},
-                {"type": "pdf", "filename": f"{user_id}.pdf"},
-                {"type": "json", "filename": f"{user_id}.json"}
+                {"type": "pdf", "filename": f"{user_id}.pdf"}
             ]
             
             # Check each file and create download URLs
@@ -1127,7 +1125,6 @@ class DownloadFile(Resource):
                 f"{user_id}.step",
                 f"{user_id}.obj",
                 f"{user_id}.pdf",
-                f"{user_id}.json",
                 "script.py"  # Allow downloading the script
             ]
             

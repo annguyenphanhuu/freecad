@@ -139,7 +139,7 @@ Multipart form:
 |---|---|---|---|
 | `file` | file | yes | FreeCAD Python script (`.py`) |
 | `user_id` | string | yes | Job identifier / storage namespace |
-| `metadata_file` | file | no | JSON with threaded-hole information |
+| `metadata_file` | file | no | Threaded-hole metadata; stored under `input/`, currently unused by the worker |
 | `priority` | int | no | `0`–`100`, higher runs first (default `0`) |
 | `auto_download` | bool | no | Block until finished and return the files |
 
@@ -211,7 +211,6 @@ client_user_upload.py       Reference CLI client
 listen_mqtt.py              Debug MQTT subscriber
 
 FreeCadUtil/                Geometry helpers (plate, bend, tube, coffre, analyzer)
-src/core/                   3D geometry utils, STEP conversion, CDT meshing
 src/utils/techdraw/         Technical drawing generation + A4 SVG templates
 sheetmetal/                 Vendored FreeCAD SheetMetal workbench (third party)
 static/, templates/         Monitor dashboard assets

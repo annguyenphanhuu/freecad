@@ -216,9 +216,9 @@ doc = FreeCAD.newDocument("TechDrawFinal")
 shape = Part.Shape()
 # Prefer a sibling .brep next to the .step if one exists (written by
 # worker.py's fast-wrapper right when the generating script exports STEP).
-# .brep import is ~120-430x faster than parsing .step (measured on
-# step_converter.py's own import path) since it's a direct dump of OCC's
-# in-memory structures instead of text that has to be re-resolved. Falls
+# .brep import is ~120-430x faster than parsing .step since it's a direct
+# dump of OCC's in-memory structures instead of text that has to be
+# re-resolved. Falls
 # back to the normal .step read if no sibling exists or the brep read fails
 # for any reason.
 _brep_path = os.path.splitext(STEP_FILE_PATH)[0] + ".brep"
