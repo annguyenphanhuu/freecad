@@ -1,0 +1,23 @@
+# Normalize text files to LF in the repository.
+* text=auto eol=lf
+
+# Files that MUST be LF - they run inside the Linux container.
+# (The Dockerfile strips CR from entrypoint.sh defensively; this makes that
+# stripping unnecessary rather than load-bearing.)
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.conf      text eol=lf
+entrypoint.sh text eol=lf
+
+# Binary assets - never touch line endings, never diff as text.
+*.png       binary
+*.ttf       binary
+*.step      binary
+*.obj       binary
+*.stl       binary
+*.ply       binary
+*.pdf       binary
+*.FCStd     binary
+
+# Generated / vendored paths: keep them out of diff noise and language stats.
+sheetmetal/** linguist-vendored

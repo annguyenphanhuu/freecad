@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tolery FreeCAD Monitor</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/css/freecad_monitor.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <div class="brand-orb"><i class="fas fa-cubes"></i></div>
+    <div class="brand-text">
+      <h1>Tolery FreeCAD Monitor</h1>
+      <div class="brand-sub">Queue Runtime Dashboard</div>
+    </div>
+  </div>
+  <nav class="top-nav">
+    <a href="/swagger/" class="nav-link"><i class="fas fa-book"></i><span>Swagger</span></a>
+    <button id="btn-pause" class="nav-btn"><i class="fas fa-pause"></i><span>Pause</span></button>
+    <button id="btn-export" class="nav-btn"><i class="fas fa-download"></i><span>Export</span></button>
+    <button id="btn-refresh" class="nav-btn accent"><i class="fas fa-rotate"></i><span>Refresh</span></button>
+  </nav>
+</header>
+
+<section class="status-strip">
+  <div class="status-left">
+    <i class="fas fa-signal"></i>
+    <span id="service-state">Loading monitor...</span>
+  </div>
+  <div class="status-right">
+    <span id="mqtt-state">MQTT -</span>
+    <span id="redis-state">Redis -</span>
+  </div>
+</section>
+
+<section class="kpi-strip">
+  <div class="kpi-card">
+    <div class="kpi-icon blue"><i class="fas fa-users-gear"></i></div>
+    <div class="kpi-body">
+      <div class="kpi-value" id="kpi-workers">0</div>
+      <div class="kpi-label">Workers</div>
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-icon green"><i class="fas fa-person-running"></i></div>
+    <div class="kpi-body">
+      <div class="kpi-value" id="kpi-running">0</div>
+      <div class="kpi-label">Running Jobs</div>
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-icon purple"><i class="fas fa-list-ol"></i></div>
+    <div class="kpi-body">
+      <div class="kpi-value" id="kpi-queued">0</div>
+      <div class="kpi-label">Queued Jobs</div>
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-icon blue"><i class="fas fa-memory"></i></div>
+    <div class="kpi-body">
+      <div class="kpi-value" id="kpi-ram">0 MB</div>
+      <div class="kpi-label">Server RAM</div>
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-icon blue"><i class="fas fa-microchip"></i></div>
+    <div class="kpi-body">
+      <div class="kpi-value" id="kpi-cpu">0%</div>
+      <div class="kpi-label">Server CPU</div>
+    </div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-icon red"><i class="fas fa-triangle-exclamation"></i></div>
+    <div class="kpi-body">
+      <div class="kpi-value" id="kpi-failed">0</div>
+      <div class="kpi-label">Failed Jobs</div>
+    </div>
+  </div>
+</section>
+
+<main class="dashboard-grid">
+  <section class="panel" id="panel-resources">
+    <div class="panel-header">
+      <div class="panel-title-group">
+        <span class="panel-dot blue"></span>
+        <div>
+          <div class="panel-title">System Resources</div>
+          <div class="panel-sub">Server, API, worker, FreeCAD process</div>
+        </div>
+      </div>
+      <i class="fas fa-server panel-icon"></i>
+    </div>
+    <div class="panel-body">
+      <div class="chart-header">
+        <span class="chart-label">RAM Used (MB)</span>
+        <div class="chart-controls">
+          <button class="chart-range active" data-minutes="1">1m</button>
+          <button class="chart-range" data-minutes="5">5m</button>
+          <button class="chart-range" data-minutes="15">15m</button>
+        </div>
+      </div>
+      <div class="chart-box"><canvas id="ram-chart"></canvas></div>
+
+      <div class="chart-header chart-space">
+        <span class="chart-label">CPU (%)</span>
+        <div class="chart-readout" id="resource-readout">Hover chart to inspect samples</div>
+      </div>
+      <div class="chart-box chart-box-sm"><canvas id="cpu-chart"></canvas></div>
+
+      <div class="stat-grid">
+        <div class="stat-row"><span>RAM Peak</span><strong id="stat-ram-peak">-</strong></div>
+        <div class="stat-row"><span>CPU Peak</span><strong id="stat-cpu-peak">-</strong></div>
+        <div class="stat-row"><span>API RSS</span><strong id="stat-api-rss">-</strong></div>
+        <div class="stat-row"><span>CPU Cores</span><strong id="stat-cores">-</strong></div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-microchip"></i> Per-Core CPU <span id="cpu-core-summary" class="section-hint">0 cores</span></div>
+        <div id="cpu-core-grid" class="cpu-core-grid"></div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-fire"></i> Live Process Peaks</div>
+        <div id="live-peaks" class="chip-row"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-pipeline">
+    <div class="panel-header">
+      <div class="panel-title-group">
+        <span class="panel-dot green"></span>
+        <div>
+          <div class="panel-title">FreeCAD Pipeline</div>
+          <div class="panel-sub">Running jobs, queue and saved history</div>
+        </div>
+      </div>
+      <i class="fas fa-diagram-project panel-icon"></i>
+    </div>
+    <div class="panel-body">
+      <div class="donut-row">
+        <div class="donut-wrap"><canvas id="stage-chart"></canvas></div>
+        <div class="step-legend" id="stage-legend">
+          <span class="empty-hint">No active jobs</span>
+        </div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-play-circle"></i> Running Requests</div>
+        <div id="running-jobs" class="request-list"></div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-layer-group"></i> Queue <span id="queue-count-label" class="section-hint">0 waiting</span></div>
+        <div id="queue-list" class="job-groups"></div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-clock-rotate-left"></i> History <span id="history-count-label" class="section-hint">0 saved</span></div>
+        <div id="history-list" class="job-groups"></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-workers">
+    <div class="panel-header">
+      <div class="panel-title-group">
+        <span class="panel-dot orange"></span>
+        <div>
+          <div class="panel-title">Workers & Sizing</div>
+          <div class="panel-sub">Capacity, latency and priority shape</div>
+        </div>
+      </div>
+      <i class="fas fa-gauge-high panel-icon"></i>
+    </div>
+    <div class="panel-body">
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-hourglass-half"></i> Latency Percentiles</div>
+        <div class="latency-grid">
+          <div class="lat-card"><div class="lat-val" id="lat-avg">-</div><div class="lat-lbl">AVG</div></div>
+          <div class="lat-card accent-p50"><div class="lat-val" id="lat-p50">-</div><div class="lat-lbl">P50</div></div>
+          <div class="lat-card accent-p90"><div class="lat-val" id="lat-p90">-</div><div class="lat-lbl">P90</div></div>
+          <div class="lat-card accent-p95"><div class="lat-val" id="lat-p95">-</div><div class="lat-lbl">P95</div></div>
+          <div class="lat-card accent-max"><div class="lat-val" id="lat-max">-</div><div class="lat-lbl">MAX</div></div>
+        </div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-people-arrows"></i> Worker Status</div>
+        <div id="worker-list" class="worker-list"></div>
+      </div>
+
+      <div class="sub-section">
+        <div class="section-title"><i class="fas fa-arrow-up-wide-short"></i> Queue By Priority</div>
+        <div id="priority-list" class="priority-list"></div>
+      </div>
+
+      <div class="sizing-box">
+        <div class="confidence-badge high">Realtime Capacity</div>
+        <div class="sizing-grid">
+          <div class="sizing-card"><i class="fas fa-users-gear sizing-icon"></i><div class="sizing-val" id="size-workers">0</div><div class="sizing-lbl">Workers</div></div>
+          <div class="sizing-card"><i class="fas fa-person-running sizing-icon"></i><div class="sizing-val" id="size-busy">0</div><div class="sizing-lbl">Busy</div></div>
+          <div class="sizing-card"><i class="fas fa-list-ol sizing-icon"></i><div class="sizing-val" id="size-queued">0</div><div class="sizing-lbl">Queued</div></div>
+          <div class="sizing-card highlight"><i class="fas fa-memory sizing-icon"></i><div class="sizing-val" id="size-total-ram">-</div><div class="sizing-lbl">Total RAM</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="statusbar">
+  <div class="status-left"><span class="pulse-dot" id="pulse-dot"></span><span id="last-updated">Not updated yet</span></div>
+  <div class="status-right"><span>Auto-refresh 1s</span><span id="footer-count">0 history</span></div>
+</footer>
+
+<script src="/static/js/freecad_monitor.js"></script>
+</body>
+</html>

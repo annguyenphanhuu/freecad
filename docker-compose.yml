@@ -1,0 +1,83 @@
+# Local single-machine stack.
+#
+# Differences from the old company setup (kept in docker-compose.dev.yml):
+#   - builds from the local Dockerfile instead of pulling from the private
+#     registry / GHCR, which is no longer reachable
+#   - NUM_WORKERS=1 instead of 3 (one FreeCAD subprocess at a time)
+#   - uses the default compose network, so no `docker network create tolery`
+#   - publishes 8020 (API) and 1883 (MQTT) to the host so the AI app can run
+#     natively with server_freecad=http://localhost:8020
+#
+# Start:  docker compose up -d --build
+# Logs:   docker compose logs -f freecad
+# Stop:   docker compose down
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: tolery_redis
+    restart: "no"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mqtt:
+    image: eclipse-mosquitto:2.0
+    container_name: tolery_mqtt
+    restart: "no"
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mqtt_data:/mosquitto/data
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep mosquitto || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  freecad:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: tolery-freecad:local
+    container_name: tolery_freecad_api
+    restart: "no"
+    environment:
+      MODE: all
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_NAME: freecad_jobs
+      STORAGE_PATH: /app/storage
+      API_HOST: 0.0.0.0
+      API_PORT: "8020"
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:8020}
+      MQTT_BROKER: mqtt://mqtt:1883
+      NUM_WORKERS: ${NUM_WORKERS:-1}
+      JOB_TIMEOUT: ${JOB_TIMEOUT:-3600}
+    volumes:
+      - ./storage:/app/storage
+      - ./outputs:/app/outputs
+    ports:
+      - "8020:8020"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mqtt:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8020/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+volumes:
+  redis_data:
+  mqtt_data:

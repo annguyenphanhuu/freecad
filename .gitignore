@@ -1,0 +1,98 @@
+# ---------------------------------------------------------------------------
+# Secrets / local configuration
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Packaging / build artifacts (anchored so a source dir named e.g. `build`
+# or `lib` further down the tree is not silently dropped)
+/build/
+/dist/
+/sdist/
+/wheels/
+/develop-eggs/
+/eggs/
+/.eggs/
+*.egg-info/
+*.egg
+.installed.cfg
+MANIFEST
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ---------------------------------------------------------------------------
+# Virtual environments
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+venv.bak/
+env.bak/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# ---------------------------------------------------------------------------
+# Runtime data (mounted as volumes, never versioned)
+# ---------------------------------------------------------------------------
+storage/
+outputs/
+dump.rdb
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# ---------------------------------------------------------------------------
+# Generated CAD artifacts
+#
+# Job output (STEP/OBJ/STL/PLY) lives under storage/ and outputs/, which are
+# already excluded above. These patterns catch stray exports dropped in the
+# repo root while debugging. The vendored sheetmetal/ workbench ships its own
+# demo .step files - those are third-party source and are kept.
+# ---------------------------------------------------------------------------
+*.step
+*.obj
+*.stl
+*.ply
+!sheetmetal/**/*.step
+
+# FreeCAD working files
+*.FCStd1
+*.FCBak
+
+# ---------------------------------------------------------------------------
+# Leftover partial clone of the AI repo sitting inside this folder.
+# It is 72 MB and contains a .env with real API keys - never commit it.
+# ---------------------------------------------------------------------------
+tolery-api-ai/

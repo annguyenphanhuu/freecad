@@ -1,338 +1,253 @@
-# FreeCAD Model Generator API (Flask + RQ + Redis + Swagger)
+# Tolery FreeCAD — Model Generator API
 
-API receives requests to create FreeCAD models, queues jobs into Redis Queue. Workers process in parallel, generating STEP and OBJ files stored in `storage/`.
+HTTP service that runs FreeCAD scripts headlessly. A client uploads a FreeCAD
+Python script, the API enqueues it on Redis (RQ), and a pool of workers executes
+it inside a real FreeCAD runtime — producing STEP / OBJ geometry plus optional
+technical drawings. Progress is streamed over MQTT and mirrored in Redis, so a
+client can either poll REST or subscribe to a topic.
 
-## 🚀 Installation and Running
+---
 
-### Docker Compose (Recommended)
+## Architecture
 
-#### Method 1: Using automatic script (Recommended)
-```bash
-# Run with 3 workers (default)
-./start.sh
-
-# Run with custom number of workers
-./start.sh 5
-
-# Run with 1 worker
-./start.sh 1
+```
+                 ┌──────────────┐
+   HTTP  ───────▶│   Flask API  │ app.py           (Swagger at /swagger/)
+                 └──────┬───────┘
+                        │ enqueue (priority queues)
+                        ▼
+                 ┌──────────────┐
+                 │    Redis     │  freecad_jobs_p{0..100} + freecad_jobs
+                 └──────┬───────┘
+                        │ RQ
+                        ▼
+                 ┌──────────────┐
+                 │  RQ workers  │ worker.py  ──▶ FreeCAD 1.0.0 (in-process)
+                 └──────┬───────┘                 FreeCadUtil/, sheetmetal/
+                        │ progress / status
+                        ▼
+                 ┌──────────────┐
+                 │ MQTT broker  │  freecad/progress/{user_id}
+                 └──────────────┘  freecad/status/{user_id}
 ```
 
-#### Method 2: Using environment variables
+Everything runs in a single container image (`MODE=all` starts the API and the
+workers side by side). Redis and MQTT are separate containers.
+
+Jobs are keyed by **`user_id`**, not by a generated job id. Input, output and
+status all live under `storage/{user_id}/`, so **do not submit two concurrent
+jobs with the same `user_id`** — the second overwrites the first.
+
+---
+
+## Quick start (Docker Compose)
+
 ```bash
-# Set number of workers and API URL
-export WORKER_REPLICAS=3
-export API_BASE_URL=http://localhost:8000
-docker-compose up -d --build
-
-# Or run directly
-WORKER_REPLICAS=5 API_BASE_URL=http://localhost:8000 docker-compose up -d --build
-
-# For production server
-export API_BASE_URL=https://your-domain.com
-export WORKER_REPLICAS=5
-./start.sh
+cp .env.example .env      # optional; every value has a working default
+docker compose up -d --build
 ```
 
-#### Method 3: Manual execution
+Then open <http://localhost:8020/swagger/>.
+
+| Service | Container | Host port |
+|---|---|---|
+| API + workers | `tolery_freecad_api` | `8020` |
+| Redis | `tolery_redis` | — (internal) |
+| MQTT (Mosquitto) | `tolery_mqtt` | `1883`, `9001` (websocket) |
+
+Useful commands:
+
 ```bash
-# Build and run all services
-docker-compose up -d --build
-
-# Scale workers manually
-docker-compose up -d --scale worker=5
-
-# View logs
-docker-compose logs -f
-
-# Stop services
-docker-compose down
+docker compose logs -f freecad
+docker compose down
 ```
 
-### Local Development
+### Rebuilding after a code change
+
+The image bakes the source in via `COPY . /app`; only `storage/` and `outputs/`
+are bind-mounted. Any change to `app.py`, `worker.py`, `src/`, `FreeCadUtil/` or
+`sheetmetal/` therefore requires a rebuild:
 
 ```bash
-# Install dependencies
+docker compose up -d --build freecad
+```
+
+The rebuild reuses the cached conda/pip layers, so it is fast unless
+`requirements.txt` changed. Changes to `mosquitto.conf` or to environment
+variables need only a restart (`docker compose up -d`), not a rebuild.
+
+### `docker-compose.dev.yml`
+
+The company deployment. It pulls a prebuilt image from the private registry
+(`registry.dfm-europe.com/...`) instead of building locally, runs 3 workers, and
+attaches to an external `tolery` network. Used by the GitLab CI deploy job — see
+[CI/CD](#cicd).
+
+---
+
+## Local development (without Docker)
+
+FreeCAD 1.0.0 must be importable by the interpreter running `worker.py`; the
+simplest route is a conda environment matching the Dockerfile.
+
+```bash
+mamba install -c conda-forge freecad=1.0.0 wkhtmltopdf networkx
 pip install -r requirements.txt
 
-# Run Redis
-redis-server
-
-# Run API server
-python app.py
-
-# Run worker (in another terminal)
-rq worker --url redis://localhost:6379 freecad_jobs
+redis-server &                                        # terminal 1
+python app.py                                         # terminal 2
+rq worker --url redis://localhost:6379/0 freecad_jobs # terminal 3
 ```
 
-## 📚 Swagger Documentation
-
-After running the API, access Swagger UI at:
-- **http://localhost:8000/swagger/**
-
-Swagger provides:
-- Interactive API documentation
-- Try-it-out functionality
-- Request/response schemas
-- Parameter validation
-
-## 🔗 API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Health check |
-| GET | `/swagger/` | Swagger UI documentation |
-| POST | `/freecad/generate` | Create new FreeCAD model (upload file + user_id) |
-| GET | `/freecad/status/{user_id}` | Check job status by user_id |
-| GET | `/freecad/result/{user_id}` | Get job result by user_id |
-| GET | `/freecad/download/{user_id}/{filename}` | Download file by user_id and filename |
-| GET | `/freecad/template/oblong` | Get template parameters |
-| GET | `/freecad/monitor` | FreeCAD runtime monitor dashboard |
-| GET | `/freecad/monitor/overview` | Monitor snapshot: workers, queue, resources, history |
-| GET | `/freecad/monitor/resources` | Recent RAM/CPU samples for charts |
-| GET | `/freecad/monitor/jobs` | Running jobs, queued jobs, and saved history |
-| GET | `/freecad/monitor/export` | Export monitor JSON |
-
-## 🔧 Configuration
-
-### Job Priority
-
-`POST /freecad/generate` accepts an optional form field named `priority`.
-
-- Range: `0` to `100`
-- Default: `0`
-- Higher values run earlier when jobs are waiting in the queue
-- Priority affects queued jobs only; running jobs are not interrupted
-
-Example:
+Sanity check with the bundled client:
 
 ```bash
-curl -X POST http://localhost:8080/freecad/generate \
+python client_user_upload.py oblong.py user123 --auto-download
+```
+
+---
+
+## API
+
+Interactive docs: `GET /swagger/`.
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/health` | Liveness probe |
+| `POST` | `/freecad/generate` | Upload a script and enqueue a job |
+| `GET` | `/freecad/status/{user_id}` | Job status + progress percentage |
+| `GET` | `/freecad/result/{user_id}` | Result payload with generated files |
+| `GET` | `/freecad/download/{user_id}/{filename}` | Download one generated file |
+| `GET` | `/freecad/python/{user_id}` | Read back the submitted script |
+| `GET` | `/freecad/download-script/{user_id}` | Download the submitted script |
+| `GET` | `/freecad/template/oblong` | Example template parameters |
+| `GET` | `/freecad/queue` | Queue depth per priority |
+| `GET` | `/freecad/workers/status` | Status of every registered worker |
+| `GET` | `/freecad/monitor` | Runtime monitor dashboard (HTML) |
+| `GET` | `/freecad/monitor/overview` | Workers, queue, resources, history |
+| `GET` | `/freecad/monitor/resources` | Recent RAM/CPU samples |
+| `GET` | `/freecad/monitor/jobs` | Running, queued and historical jobs |
+| `GET` | `/freecad/monitor/export` | Export the monitor snapshot as JSON |
+
+`/` and `/monitor` both redirect to the dashboard.
+
+### `POST /freecad/generate`
+
+Multipart form:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `file` | file | yes | FreeCAD Python script (`.py`) |
+| `user_id` | string | yes | Job identifier / storage namespace |
+| `metadata_file` | file | no | JSON with threaded-hole information |
+| `priority` | int | no | `0`–`100`, higher runs first (default `0`) |
+| `auto_download` | bool | no | Block until finished and return the files |
+
+```bash
+curl -X POST http://localhost:8020/freecad/generate \
   -F "file=@script.py" \
   -F "user_id=user123" \
   -F "priority=90"
+
+curl -s http://localhost:8020/freecad/status/user123
+curl -s http://localhost:8020/freecad/result/user123
+curl -O  http://localhost:8020/freecad/download/user123/<filename>
 ```
 
-The current storage and MQTT model treats `user_id` as the job identifier. Avoid submitting multiple active jobs with the same `user_id`, because input, output, and status are keyed by `user_id`.
+Priority only reorders *queued* jobs; a running job is never preempted. Each
+priority level is a separate RQ queue (`freecad_jobs_p{N}`) and workers drain
+them highest-first, with the legacy `freecad_jobs` queue last.
 
-### Environment Variables
+### MQTT
+
+Workers publish JSON progress to:
+
+- `freecad/progress/{user_id}` — incremental progress updates
+- `freecad/status/{user_id}` — terminal status transitions
+
+`listen_mqtt.py` is a minimal subscriber for debugging.
+
+---
+
+## Configuration
+
+All values are read from the environment (see `config.py`), with `.env` loaded
+automatically via `python-dotenv`. Copy `.env.example` to `.env` to override.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
-| `REDIS_URL` | `redis://redis:6379/0` | Redis connection URL |
-| `QUEUE_NAME` | `freecad_jobs` | Queue name for jobs |
-| `STORAGE_PATH` | `/app/storage` | Path to store generated files |
-| `API_HOST` | `0.0.0.0` | API server host |
-| `API_PORT` | `8000` | API server port |
-| `API_BASE_URL` | `http://localhost:8000` | Base URL for download links |
-| `WORKER_REPLICAS` | `3` | Number of worker replicas |
+|---|---|---|
+| `MODE` | `all` | `api`, `worker`, or `all` (set on the container, not in `.env`) |
+| `API_HOST` | `0.0.0.0` | Bind address |
+| `API_PORT` | `8080` (compose sets `8020`) | API port |
+| `API_BASE_URL` | `http://localhost:8020` | Base URL used to build download links |
+| `REDIS_URL` | `redis://localhost:6379/0` | Redis connection URL |
+| `QUEUE_NAME` | `freecad_jobs` | Base queue name |
+| `MQTT_BROKER` | `mqtt://localhost:1883` | Broker URL |
+| `STORAGE_PATH` | `/app/storage` | Where job input/output is written |
+| `NUM_WORKERS` | `3` (compose sets `1`) | FreeCAD worker processes per container |
+| `JOB_TIMEOUT` | `3600` | Per-job timeout, seconds |
+| `RESULT_TTL` | `43200` | How long successful results are kept |
+| `FAILURE_TTL` | `43200` | How long failed results are kept |
+| `MIN_JOB_PRIORITY` | `0` | Lowest priority queue |
+| `MAX_JOB_PRIORITY` | `100` | Highest priority queue |
+| `DEFAULT_JOB_PRIORITY` | `0` | Priority when the field is omitted |
 
-### Production Deployment
+FreeCAD is memory-hungry and single-threaded per document; raise `NUM_WORKERS`
+only as far as the host RAM allows (roughly 1–2 GB per concurrent job).
 
-```bash
-# Set production environment variables
-export API_BASE_URL=https://your-domain.com
-export WORKER_REPLICAS=5
+---
 
-# Start services
-./start.sh
+## Project layout
 
-# Client will automatically use the correct API URL
-python3 client_user_upload.py oblong.py user123 --auto-download
+```
+app.py                      Flask + Flask-RESTX API, Swagger, monitor routes
+worker.py                   RQ job: runs the script inside FreeCAD, exports STEP/OBJ
+config.py                   Environment-backed configuration
+entrypoint.sh               Container init: Redis fallback, N workers, API
+script_preprocessor.py      Normalizes user scripts before execution
+mqtt_client.py              Progress/status publisher
+freecad_monitor.py          Resource + job sampling behind /freecad/monitor
+client_user_upload.py       Reference CLI client
+listen_mqtt.py              Debug MQTT subscriber
+
+FreeCadUtil/                Geometry helpers (plate, bend, tube, coffre, analyzer)
+src/core/                   3D geometry utils, STEP conversion, CDT meshing
+src/utils/techdraw/         Technical drawing generation + A4 SVG templates
+sheetmetal/                 Vendored FreeCAD SheetMetal workbench (third party)
+static/, templates/         Monitor dashboard assets
+font/                       Font used by generated drawings
+storage/, outputs/          Runtime artifacts — volume-mounted, not versioned
 ```
 
-## 🧪 Testing
+`sheetmetal/` is a vendored copy of the community
+[FreeCAD SheetMetal workbench](https://github.com/shaise/FreeCAD_SheetMetal)
+(LGPL-2.1). It is pinned alongside FreeCAD 1.0.0 on purpose — do not upgrade one
+without the other.
 
-### API Client Tests
-```bash
-# Test file upload with auto-download (recommended)
-python3 client_user_upload.py oblong.py user123 --auto-download
+---
 
-# Test without auto-download
-python3 client_user_upload.py oblong.py user123
+## CI/CD
 
-# Test full workflow (equivalent to freecadcmd oblong.py)
-python client_oblong.py
+`.gitlab-ci.yml` runs on the GitLab mirror for the `develop` branch and merge
+requests targeting it:
 
-# Test with custom parameters
-python client_oblong.py --custom
+1. **build** — builds the Docker image and pushes `latest`, the short SHA, and
+   the branch slug to the private registry.
+2. **deploy** — SSHes to the dev host, pulls, and restarts the stack with
+   `docker-compose.dev.yml`.
+3. **post-deploy** — HTTP health check against the deployed Swagger endpoint.
 
-# Test using wrapper (similar to freecadcmd)
-python freecadcmd_api.py oblong
-python freecadcmd_api.py oblong --custom
-```
+Required CI variables: `SSH_PRIVATE_KEY_DEVELOP`, `DEPLOY_TOKEN_NAME`,
+`DEPLOY_TOKEN_SECRET`, plus the registry credentials GitLab injects.
 
-### Manual API Testing
+---
 
-#### 1. Health Check
-```bash
-curl -s http://localhost:8000/health
-```
+## Notes
 
-#### 2. Get Template
-```bash
-curl -s http://localhost:8000/freecad/template/oblong
-```
-
-#### 3. Generate Model (File Upload)
-```bash
-# Upload script file
-curl -X POST -F "file=@oblong_wrapper.py" -F "user_id=user123" http://localhost:8000/freecad/generate
-
-# Or with original script
-curl -X POST -F "file=@oblong.py" -F "user_id=user456" http://localhost:8000/freecad/generate
-```
-
-#### 4. Check Status
-```bash
-curl -s http://localhost:8000/freecad/status/{user_id}
-```
-
-#### 5. Get Result
-```bash
-curl -s http://localhost:8000/freecad/result/{user_id}
-```
-
-#### 6. Download File
-```bash
-# Download specific file
-curl -O http://localhost:8000/freecad/download/{user_id}/{filename}
-
-# Example
-curl -O http://localhost:8000/freecad/download/alice/Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.obj
-```
-
-## 👤 User Management
-
-API uses `user_id` to manage jobs instead of auto-generating job_id:
-
-### ✅ **Benefits:**
-- **Easy management**: Track jobs by specific user
-- **No duplicates**: Each user has separate namespace
-- **Scalable**: Supports multiple users simultaneously
-- **Predictable**: Users know the ID in advance for tracking
-
-### 📝 **Usage:**
-```bash
-# Upload with user_id
-curl -X POST -F "file=@script.py" -F "user_id=alice" http://localhost:8000/freecad/generate
-
-# Check status by user_id
-curl http://localhost:8000/freecad/status/alice
-
-# Get result by user_id  
-curl http://localhost:8000/freecad/result/alice
-```
-
-### 🔄 **Multiple Users:**
-```bash
-# User Alice
-python3 client_user_upload.py oblong.py alice
-
-# User Bob (in parallel)
-python3 client_user_upload.py oblong.py bob
-
-# User Charlie
-python3 client_user_upload.py oblong.py charlie
-```
-
-## 📥 Auto-Download Feature
-
-Client automatically downloads files to local machine when job is completed:
-
-### ✅ **Features:**
-- **Auto-download**: Files are automatically downloaded to current directory
-- **Security**: Only file owner can download
-- **Multiple formats**: Supports STEP and OBJ files
-- **Progress tracking**: Displays download progress
-
-### 📝 **How it works:**
-```bash
-# Run client - files will be automatically downloaded
-python3 client_user_upload.py oblong.py alice
-
-# Output:
-# 🎉 Job completed successfully!
-# 📁 Files generated:
-#    📄 OBJ: Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.obj
-#    📄 STEP: Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.step
-# 📥 Downloaded files:
-#    ✅ Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.obj
-#    ✅ Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.step
-# 💡 Files are now available in current directory
-```
-
-### 🔒 **Security:**
-- Files can only be downloaded by their owner
-- Filename must contain `user_id` for authentication
-- API endpoint: `/freecad/download/{user_id}/{filename}`
-
-## 📁 File Output
-
-Each job generates 2 files:
-- **STEP file**: Standard CAD 3D model
-- **OBJ file**: Mesh model for visualization
-
-Files are saved in the `storage/` directory with filenames containing parameter information and user_id.
-
-**Examples:**
-- `Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.obj`
-- `Platine_150x75x6_R15_1Oblong_D10p5x30_Center_alice.step`
-
-## ⚙️ Configuration
-
-Modify environment variables:
-- `STORAGE_PATH`: File storage path (default: `/app/storage`)
-- `REDIS_URL`: Redis URL (default: `redis://redis:6379/0`)
-- `API_PORT`: API port (default: `8000`)
-- `WORKER_REPLICAS`: Number of workers (default: `3`)
-
-**Note**: Redis runs on port `6380` to avoid conflicts with local Redis.
-
-## 📝 Notes
-
-- If FreeCAD is not available in the worker environment, placeholder STEP/OBJ files will be created
-- Worker integrates logic from `oblong.py` to create accurate models
-- API has complete Swagger documentation with validation
-
-## 🎯 Equivalent Commands
-
-Instead of running `freecadcmd oblong.py`, you can use:
-
-### **Method 1: Upload script file (NEW - Recommended)**
-```bash
-# Equivalent to: freecadcmd oblong.py
-python client_file_upload.py oblong.py
-
-# Or with wrapper script
-python client_file_upload.py oblong_wrapper.py
-```
-
-### **Method 2: API with parameters (Legacy)**
-```bash
-# Equivalent to: freecadcmd oblong.py
-python client_oblong.py
-
-# Or using wrapper
-python freecadcmd_api.py oblong
-
-# With custom parameters
-python client_oblong.py --custom
-python freecadcmd_api.py oblong --custom
-```
-
-### **Method 3: Swagger UI**
-1. Open http://localhost:8000/swagger/
-2. Select endpoint `/freecad/generate`
-3. Upload your `.py` file
-4. Click "Execute"
-
-**Benefits of API approach:**
-- ✅ **Upload script files directly** - just like `freecadcmd`
-- ✅ No need to install FreeCAD locally
-- ✅ Parallel processing with multiple workers
-- ✅ Queue management with Redis
-- ✅ RESTful API with Swagger docs
-- ✅ Easy to scale and monitor
-#   f r e e c a d  
- 
+- FreeCAD is pinned to **1.0.0**. The generated scripts and the vendored
+  sheetmetal workbench were verified against that release; an unpinned install
+  resolves to 1.1.x and breaks geometry.
+- `storage/` grows without bound (roughly 1 GB in normal use). Prune it
+  periodically — nothing in the service reclaims it.
+- The API runs Flask's development server. Put it behind a reverse proxy in
+  production; the CI deployment does exactly that.

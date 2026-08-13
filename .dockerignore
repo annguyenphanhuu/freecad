@@ -1,0 +1,45 @@
+# Build context trimming. Without this, `COPY . /app` pulls in ~1.1 GB
+# (storage/ alone is ~1 GB of generated job artifacts).
+
+# Version control
+.git
+.git/
+.gitignore
+.gitlab-ci.yml
+.github/
+
+# Generated job artifacts - mounted as volumes at runtime, never baked in
+storage/
+outputs/
+
+# Leftover partial clone of the AI repo that lives inside this folder
+tolery-api-ai/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Logs and dumps
+*.log
+logs/
+dump.rdb
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Compose files are not needed inside the image
+docker-compose*.yml

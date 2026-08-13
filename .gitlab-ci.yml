@@ -1,0 +1,125 @@
+# ============================================
+# 1. WORKFLOW
+# ============================================
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+
+# ============================================
+# 2. STAGES DEFINITION
+# ============================================
+stages:
+  - build
+  - deploy
+  - post-deploy
+
+# ============================================
+# 3. DEFAULT CONFIGURATION
+# ============================================
+default:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - script_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+# ============================================
+# 4. VARIABLES
+# ============================================
+variables:
+  GIT_DEPTH: "0"
+
+# ============================================
+# 5. JOB TEMPLATES
+# ============================================
+.build_template:
+  stage: build
+  image: docker
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin
+  script:
+    - |
+      docker build \
+        -t $CI_REGISTRY_IMAGE:latest \
+        -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA \
+        -t $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG \
+        .
+    - docker push $CI_REGISTRY_IMAGE:latest
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    - docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG
+
+.deploy_template:
+  stage: deploy
+  image: kroniak/ssh-client:latest
+  script:
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo -e "Host *\n\tStrictHostKeyChecking no\n\tUserKnownHostsFile=/dev/null\n" > ~/.ssh/config
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - |
+      ssh "${SSH_USER:-root}@${SSH_HOST}" ${SSH_PORT:+-p ${SSH_PORT}} "
+        set -e &&
+        cd ${REMOTE_WORKDIR} &&
+        echo \"${DEPLOY_TOKEN_SECRET}\" | docker login registry.dfm-europe.com -u \"${DEPLOY_TOKEN_NAME}\" --password-stdin &&
+        sudo git stash &&
+        sudo git pull origin ${GIT_BRANCH:-develop} &&
+        sudo docker compose -f ${DOCKER_COMPOSE_FILE:-docker-compose.dev.yml} pull &&
+        sudo docker compose -f ${DOCKER_COMPOSE_FILE:-docker-compose.dev.yml} down -v &&
+        sudo docker compose -f ${DOCKER_COMPOSE_FILE:-docker-compose.dev.yml} up -d &&
+        sudo docker image prune -af
+      "
+
+.healthcheck_template:
+  stage: post-deploy
+  image: curlimages/curl:latest
+  script:
+    - sleep ${HEALTHCHECK_WAIT_TIME:-30}
+    - |
+      status=$(curl -s -o /dev/null -w "%{http_code}" --max-time ${HEALTHCHECK_TIMEOUT:-10} ${HEALTHCHECK_URL})
+      if [ "$status" -ge 200 ] && [ "$status" -lt 400 ]; then
+        echo "Website is healthy (HTTP $status)"
+      else
+        echo "Website health check failed (HTTP $status)"
+        exit 1
+      fi
+
+# ============================================
+# 6. MERGE REQUEST JOBS
+# ============================================
+build_MR:
+  extends: .build_template
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "develop"'
+
+# ============================================
+# 7. DEVELOP BRANCH JOBS
+# ============================================
+build_develop:
+  extends: .build_template
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "push"'
+
+deploy_develop:
+  extends: .deploy_template
+  variables:
+    SSH_PRIVATE_KEY: "$SSH_PRIVATE_KEY_DEVELOP"
+    SSH_HOST: 80.15.134.2
+    SSH_PORT: 30305
+    REMOTE_WORKDIR: /home/dfm/tolery-freecad/tolery-freecad
+    DOCKER_COMPOSE_FILE: docker-compose.dev.yml
+    GIT_BRANCH: develop
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "push"'
+
+healthcheck_develop:
+  extends: .healthcheck_template
+  variables:
+    HEALTHCHECK_URL: https://toleryfreecad.vm.dfm-europe.com/swagger/
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop" && $CI_PIPELINE_SOURCE == "push"'
