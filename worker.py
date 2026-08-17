@@ -13,6 +13,21 @@ from pathlib import Path
 from mqtt_client import get_mqtt_manager
 from redis import Redis
 from freecad_monitor import JobResourceTracker
+from job_contract import (
+    CODE_JOB_TIMEOUT,
+    CODE_MISSING_OUTPUT,
+    CODE_PARTIAL_EXPORT,
+    CODE_SERVER_INTERNAL,
+    EXEC_TIMEOUT_SECONDS,
+    STATUS_COMPLETE,
+    STATUS_FAILED,
+    STATUS_PARTIAL_SUCCESS,
+    TAIL_LINES,
+    build_error,
+    build_outcome,
+    classify_script_failure,
+    write_outcome,
+)
 
 STORAGE_PATH = os.getenv("STORAGE_PATH", "/app/storage")
 os.makedirs(STORAGE_PATH, exist_ok=True)
@@ -372,7 +387,12 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
     )
 
     mqtt_manager = get_mqtt_manager()
-    
+
+    # Where the outcome envelope is persisted. This is the directory the API
+    # reads through /freecad/result, so the file lands next to the job's files
+    # and survives an MQTT outage, a broker restart or an API restart.
+    outcome_dir = output_dir if output_dir else STORAGE_PATH
+
     # Structured result tracking (similar to PreprocessorResult pattern)
     execution_result = {
         "success": False,
@@ -384,6 +404,50 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
         "validation_passed": False
     }
 
+    def _finish(status, message, code=None, error=None, details=None, freecad_pid=None):
+        """The single exit point of this job.
+
+        Every terminal path goes through here, so a job can never be announced
+        without a code, announced twice with different wording, or written to
+        disk in a shape the API does not expect. It: builds the envelope,
+        persists it, publishes it, records it for the monitor, and returns it as
+        the RQ result.
+        """
+        outcome = build_outcome(
+            user_id=user_id,
+            status=status,
+            message=message,
+            code=code,
+            error=error,
+            details=details,
+            worker_id=worker_id,
+        )
+
+        # Disk first: publishing can fail silently when the broker is down, but
+        # a persisted outcome is always readable over HTTP afterwards.
+        write_outcome(outcome_dir, outcome)
+        mqtt_manager.publish_outcome(outcome)
+
+        monitor_tracker.finish(
+            status=status,
+            message=message,
+            progress=outcome["progress"],
+            freecad_pid=freecad_pid,
+            details=outcome.get("error") or outcome.get("details") or {},
+        )
+
+        # Read the code back off the envelope: most call sites pass it inside
+        # `error` and leave `code` unset, and build_outcome derives it there.
+        final_code = outcome.get("code")
+        print("=" * 70)
+        print(f"[{worker_id}] JOB {status.upper()}" + (f" ({final_code})" if final_code else ""))
+        print(f"[{worker_id}] {message}")
+        print("=" * 70)
+
+        rq_result = dict(outcome)
+        rq_result["execution_result"] = execution_result
+        return rq_result
+
     try:
         monitor_tracker.sample(
             "initializing",
@@ -392,28 +456,16 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
             message="Worker picked up job and is validating inputs",
         )
 
-        # Validate script path exists
+        # Validate script path exists. The API uploaded this file moments ago,
+        # so its absence is this server losing it, not a bad model.
         if not os.path.exists(script_path):
             error_msg = f"Script file not found: {script_path}"
             execution_result["errors"].append(error_msg)
-            mqtt_manager.publish_final_status(
-                user_id=user_id,
-                status="failed",
-                message=error_msg,
-                details={"script_path": script_path},
-                worker_id=worker_id
+            return _finish(
+                STATUS_FAILED,
+                error_msg,
+                error=build_error(CODE_SERVER_INTERNAL, error_msg, script_path=script_path),
             )
-            monitor_tracker.finish(
-                status="failed",
-                message=error_msg,
-                progress=0,
-                details={"script_path": script_path},
-            )
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "execution_result": execution_result
-            }
         
         # Use provided output_dir or create temp directory
         if output_dir:
@@ -552,15 +604,12 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                 message="freecadcmd subprocess started",
             )
 
-            # Wait for process with timeout (increased for heavy files).
-            # Diagnostic run at 600s showed real (non-isolated) execution
-            # can genuinely take ~470-500s on a 4700-hole perforated sheet --
-            # not just marginally over the old 300s edge -- so 300s was
-            # cutting off real jobs, not just catching hangs. Set to 900s
-            # (15 min) as a safety ceiling well above observed real-world
-            # time, not as a target.
+            # Wait for the process. The ceiling and the reasoning behind it live
+            # in job_contract.EXEC_TIMEOUT_SECONDS -- one constant, so the
+            # number in the message can never contradict the number enforced
+            # (the old code waited 900s and reported "300").
             try:
-                process.wait(timeout=900)
+                process.wait(timeout=EXEC_TIMEOUT_SECONDS)
                 returncode = process.returncode
                 stdout, stderr = _read_and_cleanup_captured_output()
                 print(f"[WALLCLOCK] freecadcmd process.wait() returned at t={time.perf_counter()-_wall_t0:.2f}s")
@@ -571,27 +620,24 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                 process.kill()
                 process.wait()
                 stdout, stderr = _read_and_cleanup_captured_output()
-                returncode = -1
-                error_msg = "FreeCAD command timed out after 15 minutes"
                 heartbeat_stop.set()
-                mqtt_manager.publish_final_status(
-                    user_id=user_id,
-                    status="failed",
-                    message=error_msg,
-                    details=None,
-                    worker_id=worker_id
+                error_msg = (
+                    f"FreeCAD execution exceeded the {EXEC_TIMEOUT_SECONDS}s limit "
+                    f"and was stopped"
                 )
-                monitor_tracker.finish(
-                    status="failed",
-                    message=error_msg,
-                    progress=0,
+                execution_result["errors"].append(error_msg)
+                return _finish(
+                    STATUS_FAILED,
+                    error_msg,
+                    error=build_error(
+                        CODE_JOB_TIMEOUT,
+                        error_msg,
+                        stdout_tail=(stdout or "").splitlines()[-TAIL_LINES:],
+                        stderr_tail=(stderr or "").splitlines()[-TAIL_LINES:],
+                        timeout_seconds=EXEC_TIMEOUT_SECONDS,
+                    ),
                     freecad_pid=freecad_pid_holder["pid"],
-                    details={"timeout": True, "timeout_seconds": 300},
                 )
-                return {
-                    "status": "failed",
-                    "error": error_msg
-                }
 
             result = type('obj', (object,), {
                 'returncode': returncode,
@@ -619,17 +665,10 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                 error_msg = f"FreeCAD command failed with exit code {result.returncode}"
 
             # Include helpful diagnostics
-            stdout_tail = (result.stdout or "").splitlines()[-50:]
-            stderr_tail = (result.stderr or "").splitlines()[-50:]
+            stdout_tail = (result.stdout or "").splitlines()[-TAIL_LINES:]
+            stderr_tail = (result.stderr or "").splitlines()[-TAIL_LINES:]
             error_hint = _extract_error_hint("\n".join(stdout_tail), "\n".join(stderr_tail))
-            details = {
-                "error_hint": error_hint,
-                "specific_exception": specific_exception,
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-                "returncode": result.returncode,
-            }
-            
+
             # Record in execution result
             execution_result["errors"].append(error_msg)
             if specific_exception:
@@ -637,35 +676,23 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
             if error_hint:
                 execution_result["warnings"].append(f"Error hint: {error_hint}")
 
-            print("=" * 70)
-            print(f"[{worker_id}] ❌ EXECUTION FAILED")
-            print(f"[{worker_id}] Error: {error_msg}")
-            if specific_exception:
-                print(f"[{worker_id}] Exception: {specific_exception}")
-            if error_hint:
-                print(f"[{worker_id}] Hint: {error_hint}")
-            print("=" * 70)
-
-            mqtt_manager.publish_final_status(
-                user_id=user_id,
-                status="failed",
-                message=error_msg,
-                details=details,
-                worker_id=worker_id
-            )
-            monitor_tracker.finish(
-                status="failed",
-                message=error_msg,
-                progress=0,
+            return _finish(
+                STATUS_FAILED,
+                error_msg,
+                error=build_error(
+                    # The only distinction worth drawing from the output: an
+                    # encoding fault is actionable for the user, everything else
+                    # is "the script raised".
+                    classify_script_failure(result.stdout, result.stderr, error_msg),
+                    error_msg,
+                    specific_exception=specific_exception,
+                    error_hint=error_hint,
+                    stdout_tail=stdout_tail,
+                    stderr_tail=stderr_tail,
+                    returncode=result.returncode,
+                ),
                 freecad_pid=freecad_pid_holder["pid"],
-                details=details,
             )
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "details": details,
-                "execution_result": execution_result
-            }
 
         # Validation gate: ensure both STEP and OBJ were generated and valid before proceeding
         mqtt_manager.publish_progress(
@@ -715,56 +742,38 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                 print(f"[{worker_id}]     ⚠ {error}")
 
         if len(valid_step) == 0:
-            # Build diagnostics
-            # OBJ is intentionally NOT required here: nothing downstream (PDF gen,
-            # the active STEP 3D viewer) reads the .obj file -- it only fed a
-            # now-dormant legacy viewer. STEP is the only hard requirement for
-            # the rest of the pipeline to proceed.
-            stdout_tail = (result.stdout or "").splitlines()[-50:]
-            stderr_tail = (result.stderr or "").splitlines()[-50:]
+            # STEP is this server's only hard requirement: without it there is
+            # no model at all and nothing further can run. Whether a missing OBJ
+            # should also fail the job is the CLIENT's policy (tolery-api-ai
+            # requires OBJ for every shape except Perforated Sheet) -- so the
+            # outcome below reports which files exist and lets the client apply
+            # its own rule, instead of the two sides silently disagreeing.
+            stdout_tail = (result.stdout or "").splitlines()[-TAIL_LINES:]
+            stderr_tail = (result.stderr or "").splitlines()[-TAIL_LINES:]
             error_hint = _extract_error_hint("\n".join(stdout_tail), "\n".join(stderr_tail))
 
-            missing_types = ["STEP"]
-            error_msg = f"CAD generation failed: missing required outputs ({' and '.join(missing_types)})."
+            error_msg = "CAD generation failed: no STEP file was produced."
             if error_hint:
                 error_msg += f" FreeCAD error: {error_hint}"
 
-            details = {
-                "error_hint": error_hint,
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-                "validation_errors": validation.get("errors", []),
-                "validated_files": [f["filename"] for f in validation.get("files", [])],
-            }
-
-            print("=" * 70)
-            print(f"[{worker_id}] ❌ VALIDATION FAILED")
-            print(f"[{worker_id}] Error: {error_msg}")
-            print(f"[{worker_id}] Missing types: {', '.join(missing_types)}")
-            print("=" * 70)
-            
             execution_result["errors"].append(error_msg)
             execution_result["validation_passed"] = False
-            
-            mqtt_manager.publish_final_status(
-                user_id=user_id,
-                status="failed",
-                message=error_msg,
-                details=details,
-                worker_id=worker_id
+
+            return _finish(
+                STATUS_FAILED,
+                error_msg,
+                error=build_error(
+                    CODE_MISSING_OUTPUT,
+                    error_msg,
+                    error_hint=error_hint,
+                    stdout_tail=stdout_tail,
+                    stderr_tail=stderr_tail,
+                    missing_types=["step"],
+                    validation_errors=validation.get("errors", []),
+                    validated_files=[f["filename"] for f in validation.get("files", [])],
+                ),
+                freecad_pid=freecad_pid_holder["pid"],
             )
-            monitor_tracker.finish(
-                status="failed",
-                message=error_msg,
-                progress=0,
-                details=details,
-            )
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "details": details,
-                "execution_result": execution_result
-            }
 
         # Find generated files
         generated_files = []
@@ -878,54 +887,34 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                 pass
 
         if not generated_files:
-            # Extract diagnostics from the FreeCAD run output FIRST
-            stdout_tail = (result.stdout or "").splitlines()[-50:]
-            stderr_tail = (result.stderr or "").splitlines()[-50:]
+            # Reached only if files validated a moment ago and then could not be
+            # collected — a server-side file-handling problem, though from the
+            # user's side the outcome is the same missing output.
+            stdout_tail = (result.stdout or "").splitlines()[-TAIL_LINES:]
+            stderr_tail = (result.stderr or "").splitlines()[-TAIL_LINES:]
             error_hint = _extract_error_hint("\n".join(stdout_tail), "\n".join(stderr_tail))
             
-            error_msg = "No STEP or OBJ files were generated"
+            error_msg = "No STEP or OBJ files could be collected after execution"
             if error_hint:
                 error_msg += f". FreeCAD error: {error_hint}"
-            details = {
-                "error_hint": error_hint,
-                "stdout_tail": stdout_tail,
-                "stderr_tail": stderr_tail,
-                "searched_directories": [user_output_dir, "/app/cad_outputs_generated"]
-            }
-            
+
             execution_result["errors"].append(error_msg)
             if error_hint:
                 execution_result["warnings"].append(f"Error hint: {error_hint}")
-            
-            print("=" * 70)
-            print(f"[{worker_id}] ❌ NO FILES GENERATED")
-            print(f"[{worker_id}] Error: {error_msg}")
-            print(f"[{worker_id}] Searched directories:")
-            print(f"[{worker_id}]   - {user_output_dir}")
-            print(f"[{worker_id}]   - /app/cad_outputs_generated")
-            if error_hint:
-                print(f"[{worker_id}] Hint: {error_hint}")
-            print("=" * 70)
-            
-            mqtt_manager.publish_final_status(
-                user_id=user_id,
-                status="failed",
-                message=error_msg,
-                details=details,
-                worker_id=worker_id
+
+            return _finish(
+                STATUS_FAILED,
+                error_msg,
+                error=build_error(
+                    CODE_MISSING_OUTPUT,
+                    error_msg,
+                    error_hint=error_hint,
+                    stdout_tail=stdout_tail,
+                    stderr_tail=stderr_tail,
+                    searched_directories=[user_output_dir, "/app/cad_outputs_generated"],
+                ),
+                freecad_pid=freecad_pid_holder["pid"],
             )
-            monitor_tracker.finish(
-                status="failed",
-                message=error_msg,
-                progress=0,
-                details=details,
-            )
-            return {
-                "status": "failed",
-                "error": error_msg,
-                "details": details,
-                "execution_result": execution_result
-            }
 
         print(f"[WALLCLOCK] File discovery/validation done at t={time.perf_counter()-_wall_t0:.2f}s")
         _wc_mark("file_discovery_done")
@@ -1003,11 +992,14 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
                     file_generation_status["pdf"]["failures"].append(failure_info)
                     print(f"[{worker_id}] ⚠️ PDF generation failed for {file_info['filename']}: {error_msg}")
 
-                    # Send MQTT message about PDF failure but continue processing
-                    mqtt_manager.publish_status(
-                        user_id, "warning",
-                        f"Failed to generate PDF file: {error_msg}",
-                        json.dumps(failure_info),
+                    # Report it as PROGRESS, not as a status. This used to
+                    # publish status="warning" mid-job, which the client reads as
+                    # a terminal state: it marked the job finished and hung up
+                    # while the worker was still running. The PDF failure is
+                    # carried by the final partial_success outcome instead.
+                    mqtt_manager.publish_progress(
+                        user_id, progress, "running",
+                        f"PDF generation failed (optional, continuing): {error_msg}",
                         worker_id=worker_id
                     )
 
@@ -1036,157 +1028,91 @@ def execute_freecad_script(script_path: str, user_id: str = None, output_dir: st
         print(f"[WALLCLOCK] execute_freecad_script about to return at t={time.perf_counter()-_wall_t0:.2f}s")
         _wc_mark("about_to_return")
         _wc_dump()
+        # `details` describes what WAS produced, for both outcomes: the client
+        # applies its own policy on which of those files it requires, so it needs
+        # the list whether the job was complete or partial.
+        status_details["files"] = [
+            {"type": f["type"], "filename": f["filename"]} for f in all_files
+        ]
+
         if all_files_generated:
-            # All files generated successfully
             success_msg = f"Job completed successfully! All {total_expected} expected files were generated."
-            
+
             execution_result["success"] = True
             execution_result["validation_passed"] = True
             execution_result["files_generated"] = [f["filename"] for f in all_files]
             execution_result["changes"].append(f"All {total_expected} files generated successfully")
-            
-            print("=" * 70)
-            print(f"[{worker_id}] ✅ EXECUTION SUCCESSFUL")
-            print(f"[{worker_id}] Message: {success_msg}")
-            print(f"[{worker_id}] Generated files ({len(all_files)}):")
+
             for f in all_files:
                 print(f"[{worker_id}]   ✓ {f['filename']}")
-            print("=" * 70)
 
-            mqtt_manager.publish_final_status(
-                user_id=user_id,
-                status="complete",
-                message=success_msg,
-                details=status_details,
-                worker_id=worker_id
+            return _finish(STATUS_COMPLETE, success_msg, details=status_details)
+
+        # Partial success: the model exists, an optional export does not. Today
+        # that is only ever the PDF — STEP/OBJ absence fails the job earlier.
+        failure_summary = []
+        if file_generation_status["pdf"]["failures"]:
+            failure_summary.append(
+                f"PDF files: {file_generation_status['pdf']['generated']}/{file_generation_status['pdf']['expected']} generated"
             )
-            monitor_tracker.finish(
-                status="complete",
-                message=success_msg,
-                progress=100,
-                details=status_details,
-            )
+            for failure in file_generation_status["pdf"]["failures"]:
+                failure_summary.append(f"  - {failure['step_file']}: {failure['error']}")
 
-            return {
-                "status": "success",
-                "files": all_files,
-                "file_status": file_generation_status,
-                "execution_result": execution_result
-            }
-        else:
-            # Partial success - some files failed
-            failure_summary = []
+        partial_msg = (f"Job completed with partial success. Generated {total_generated}/{total_expected} files. "
+                       f"Failures: {', '.join(failure_summary)}")
 
-            if file_generation_status["pdf"]["failures"]:
-                failure_summary.append(
-                    f"PDF files: {file_generation_status['pdf']['generated']}/{file_generation_status['pdf']['expected']} generated"
-                )
-                for failure in file_generation_status["pdf"]["failures"]:
-                    failure_summary.append(f"  - {failure['step_file']}: {failure['error']}")
+        execution_result["success"] = False  # Partial success is not full success
+        execution_result["files_generated"] = [f["filename"] for f in all_files]
+        execution_result["warnings"].append(partial_msg)
+        execution_result["changes"].append(f"Generated {total_generated}/{total_expected} files")
 
-            partial_msg = (f"Job completed with partial success. Generated {total_generated}/{total_expected} files. "
-                          f"Failures: {', '.join(failure_summary)}")
-
-            execution_result["success"] = False  # Partial success is not full success
-            execution_result["files_generated"] = [f["filename"] for f in all_files]
-            execution_result["warnings"].append(partial_msg)
-            execution_result["changes"].append(f"Generated {total_generated}/{total_expected} files")
-            
-            print("=" * 70)
-            print(f"[{worker_id}] ⚠️ PARTIAL SUCCESS")
-            print(f"[{worker_id}] Message: {partial_msg}")
-            print(f"[{worker_id}] Successfully generated ({len(all_files)}):")
-            for f in all_files:
-                print(f"[{worker_id}]   ✓ {f['filename']}")
-            if failure_summary:
-                print(f"[{worker_id}] Failures:")
-                for failure in failure_summary:
-                    print(f"[{worker_id}]   ✗ {failure}")
-            print("=" * 70)
-
-            mqtt_manager.publish_final_status(
-                user_id=user_id,
-                status="partial_success",
-                message=partial_msg,
-                details=status_details,
-                worker_id=worker_id
-            )
-            monitor_tracker.finish(
-                status="partial_success",
-                message=partial_msg,
-                progress=90,
-                details=status_details,
-            )
-
-            return {
-                "status": "partial_success",
-                "files": all_files,
-                "file_status": file_generation_status,
-                "message": partial_msg,
-                "execution_result": execution_result
-            }
+        return _finish(
+            STATUS_PARTIAL_SUCCESS,
+            partial_msg,
+            error=build_error(
+                CODE_PARTIAL_EXPORT,
+                partial_msg,
+                missing_types=[
+                    kind for kind in ("pdf",)
+                    if file_generation_status[kind]["generated"] < file_generation_status[kind]["expected"]
+                ],
+                failures=file_generation_status["pdf"]["failures"],
+            ),
+            details=status_details,
+        )
 
     except subprocess.TimeoutExpired:
-        error_msg = "FreeCAD command timed out after 5 minutes"
+        # Not the freecadcmd timeout (handled at its own call site with the real
+        # limit) — this catches a timeout from any other subprocess in the job,
+        # e.g. the PDF/technical-drawing step.
+        error_msg = f"A subprocess in the job timed out: {sys.exc_info()[1]}"
         execution_result["errors"].append(error_msg)
-        execution_result["warnings"].append("Process exceeded maximum execution time")
-        
-        print("=" * 70)
-        print(f"[{worker_id}] ❌ TIMEOUT ERROR")
-        print(f"[{worker_id}] Error: {error_msg}")
-        print("=" * 70)
-        
-        mqtt_manager.publish_final_status(
-            user_id=user_id,
-            status="failed",
-            message=error_msg,
-            details={"timeout": True, "timeout_seconds": 300},
-            worker_id=worker_id
+
+        return _finish(
+            STATUS_FAILED,
+            error_msg,
+            error=build_error(CODE_JOB_TIMEOUT, error_msg, stage="subprocess"),
         )
-        monitor_tracker.finish(
-            status="failed",
-            message=error_msg,
-            progress=0,
-            details={"timeout": True, "timeout_seconds": 300},
-        )
-        return {
-            "status": "failed",
-            "error": error_msg,
-            "execution_result": execution_result
-        }
     except Exception as e:
-        error_msg = f"Unexpected error: {str(e)}"
-        execution_result["errors"].append(error_msg)
-        
         import traceback
         tb = traceback.format_exc()
+
+        error_msg = f"The FreeCAD server failed while handling the job: {e}"
+        execution_result["errors"].append(error_msg)
         execution_result["warnings"].append(f"Traceback: {tb[:500]}")  # Limit traceback length
-        
-        print("=" * 70)
-        print(f"[{worker_id}] ❌ UNEXPECTED ERROR")
-        print(f"[{worker_id}] Error: {error_msg}")
-        print(f"[{worker_id}] Traceback:")
+
         print(tb)
-        print("=" * 70)
-        
-        mqtt_manager.publish_final_status(
-            user_id=user_id,
-            status="failed",
-            message=error_msg,
-            details={"exception_type": type(e).__name__, "traceback": tb[:1000]},
-            worker_id=worker_id
+
+        return _finish(
+            STATUS_FAILED,
+            error_msg,
+            error=build_error(
+                CODE_SERVER_INTERNAL,
+                error_msg,
+                exception_type=type(e).__name__,
+                traceback=tb[:1000],
+            ),
         )
-        monitor_tracker.finish(
-            status="failed",
-            message=error_msg,
-            progress=0,
-            details={"exception_type": type(e).__name__, "traceback": tb[:1000]},
-        )
-        return {
-            "status": "failed",
-            "error": error_msg,
-            "execution_result": execution_result
-        }
     finally:
         # Keep uploaded script file for diagnostics and re-download if needed
         # Do not delete script_path here so that admins can fetch the .py by user_id later

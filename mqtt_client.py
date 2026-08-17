@@ -13,6 +13,7 @@ import json
 import threading
 import time
 import config
+from job_contract import TERMINAL_STATUSES
 
 
 def _get_host_ip():
@@ -132,25 +133,24 @@ class MQTTProgressManager:
                             "progress": 0,
                             "message": "",
                             "updated_at": None,
+                            "code": None,
                             "error": None,
-                            "details": None
+                            "details": None,
+                            "final": False,
                         }
 
-                    # Update progress data
-                    if "progress" in message_data:
-                        self.progress_data[user_id]["progress"] = message_data["progress"]
-                    if "status" in message_data:
-                        self.progress_data[user_id]["status"] = message_data["status"]
-                    if "message" in message_data:
-                        self.progress_data[user_id]["message"] = message_data["message"]
-                    if "error" in message_data:
-                        self.progress_data[user_id]["error"] = message_data["error"]
-                    if "details" in message_data:
-                        self.progress_data[user_id]["details"] = message_data["details"]
-                    if "worker_id" in message_data:
-                        self.progress_data[user_id]["worker_id"] = message_data["worker_id"]
-                    if "timestamp" in message_data:
-                        self.progress_data[user_id]["timestamp"] = message_data["timestamp"]
+                    # Copy every field of the envelope through verbatim. A
+                    # running update carries no code/error, and must not erase
+                    # the code of a terminal one that arrived first — final
+                    # messages go to BOTH topics, so the same user can get a
+                    # 'running' straggler afterwards.
+                    if message_data.get("final") or not self.progress_data[user_id].get("final"):
+                        for key in (
+                            "progress", "status", "message", "code", "error",
+                            "details", "worker_id", "timestamp", "final",
+                        ):
+                            if key in message_data:
+                                self.progress_data[user_id][key] = message_data[key]
 
                     self.progress_data[user_id]["updated_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -189,6 +189,18 @@ class MQTTProgressManager:
         """Get progress for all users"""
         with self.lock:
             return self.progress_data.copy()
+
+    def reset_progress(self, user_id: str) -> None:
+        """Forget everything known about a user's previous job.
+
+        user_id doubles as the job key, so a user who submits a second time
+        would otherwise inherit the first job's terminal state — and since a
+        terminal message is sticky (see _on_message), the new job's updates
+        would be ignored and the client would read the old verdict as if it
+        belonged to the new job. Called when a job is queued.
+        """
+        with self.lock:
+            self.progress_data.pop(user_id, None)
     
     def publish_progress(
         self,
@@ -196,14 +208,14 @@ class MQTTProgressManager:
         progress: int,
         status: str,
         message: str = "",
-        error: str = None,
         worker_id: str = None,
     ) -> None:
-        """Publish progress update to MQTT"""
+        """Publish a progress update. Carries no code and no error by design:
+        progress says how far the job got, never whether it succeeded."""
         if not self.connected:
             print("MQTT not connected, cannot publish progress")
             return
-        
+
         try:
             topic = f"freecad/progress/{user_id}"
             data = {
@@ -211,12 +223,10 @@ class MQTTProgressManager:
                 "progress": progress,
                 "status": status,
                 "message": message,
+                "final": False,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
-            
-            if error:
-                data["error"] = error
-            
+
             if worker_id:
                 data["worker_id"] = worker_id
             
@@ -232,21 +242,23 @@ class MQTTProgressManager:
         user_id: str,
         status: str,
         message: str = "",
-        error: str = None,
-        details: str = None,
         worker_id: str = None,
     ) -> None:
         """
-        Publish status update to MQTT
+        Publish a NON-terminal status ("queued", "running").
 
-        Args:
-            user_id: User identifier
-            status: Status string (e.g., "complete", "failed", "partial_success")
-            message: Human-readable status message
-            error: Error information (only for failed status)
-            details: Success details (only for complete/partial_success status)
-            worker_id: Worker identifier
+        A terminal status must go through publish_outcome() instead — it is the
+        only thing that also carries a code and gets written to disk. Publishing
+        "failed"/"complete"/"partial_success" here would tell the client the job
+        is over while leaving it without any way to know why, so it is refused.
         """
+        if status in TERMINAL_STATUSES:
+            print(
+                f"Refusing to publish terminal status '{status}' for user {user_id} "
+                f"through publish_status(); use publish_outcome()"
+            )
+            return
+
         if not self.connected:
             print("MQTT not connected, cannot publish status")
             return
@@ -257,14 +269,9 @@ class MQTTProgressManager:
                 "user_id": user_id,
                 "status": status,
                 "message": message,
+                "final": False,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
-
-            if error:
-                data["error"] = error
-
-            if details:
-                data["details"] = details
 
             if worker_id:
                 data["worker_id"] = worker_id
@@ -276,70 +283,53 @@ class MQTTProgressManager:
         except Exception as e:
             print(f"Error publishing status: {e}")
 
-    def publish_final_status(
-        self,
-        user_id: str,
-        status: str,
-        message: str,
-        details: Dict[str, Any] = None,
-        worker_id: str = None
-    ) -> None:
+    def publish_outcome(self, outcome: Dict[str, Any]) -> bool:
         """
-        Publish final job status with both progress and status in ONE message.
-        This is the ONLY method that should be called when a job finishes.
+        Publish a terminal outcome envelope. The ONLY way a job announces that
+        it has finished, whatever the result.
 
-        Status mapping:
-        - "complete": progress=100, all files generated successfully
-        - "partial_success": progress=90, some files failed but job completed
-        - "failed": progress=0, job failed completely
+        The envelope is built by job_contract.build_outcome() and is published
+        **verbatim**: `code`, `error` and `details` stay real JSON values. They
+        used to be re-encoded with json.dumps() into a string field, which forced
+        the reader to parse a string out of a parsed message and lost every
+        detail the moment anyone forgot to.
 
-        Args:
-            user_id: User identifier
-            status: Final status ("complete", "partial_success", "failed")
-            message: Human-readable status message
-            details: Additional details (files, errors, etc.)
-            worker_id: Worker identifier
+        Returns True if the message went out. A False here is not a lost job:
+        the worker also writes the same envelope to disk, and /freecad/status
+        and /freecad/result read it from there.
         """
+        user_id = outcome.get("user_id")
+        if not user_id:
+            print("Refusing to publish an outcome with no user_id")
+            return False
+
         if not self.connected:
-            print("MQTT not connected, cannot publish final status")
-            return
+            # Loud, because from here on the client only learns the outcome
+            # through the slower HTTP fallback.
+            print(
+                f"MQTT NOT CONNECTED - outcome for user {user_id} "
+                f"({outcome.get('status')}) not published; it is on disk only"
+            )
+            return False
 
         try:
-            # Determine progress based on status
-            progress_map = {
-                "complete": 100,
-                "partial_success": 90,
-                "failed": 0
-            }
-            progress = progress_map.get(status, 0)
+            payload = json.dumps(outcome)
+            # Both topics: subscribers listen to progress for the bar and to
+            # status for the verdict, and a terminal message is both.
+            self.client.publish(f"freecad/status/{user_id}", payload)
+            self.client.publish(f"freecad/progress/{user_id}", payload)
 
-            # Create consistent data structure
-            timestamp = datetime.now(timezone.utc).isoformat()
-
-            data = {
-                "user_id": user_id,
-                "status": status,
-                "progress": progress,
-                "message": message,
-                "timestamp": timestamp,
-                "final": True  # Indicates this is the final message
-            }
-
-            if details:
-                data["details"] = json.dumps(details) if isinstance(details, dict) else details
-
-            if worker_id:
-                data["worker_id"] = worker_id
-
-            # Publish to both topics with consistent data
-            self.client.publish(f"freecad/status/{user_id}", json.dumps(data))
-            self.client.publish(f"freecad/progress/{user_id}", json.dumps(data))
-
-            worker_info = f" [Worker: {worker_id}]" if worker_id else ""
-            print(f"Published FINAL status for user {user_id}{worker_info}: {status} ({progress}%)")
+            worker_info = f" [Worker: {outcome.get('worker_id')}]" if outcome.get("worker_id") else ""
+            code_info = f" code={outcome.get('code')}" if outcome.get("code") else ""
+            print(
+                f"Published FINAL outcome for user {user_id}{worker_info}: "
+                f"{outcome.get('status')} ({outcome.get('progress')}%){code_info}"
+            )
+            return True
 
         except Exception as e:
-            print(f"Error publishing final status: {e}")
+            print(f"Error publishing final outcome: {e}")
+            return False
 
 
 # Global MQTT manager instance

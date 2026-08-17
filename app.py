@@ -18,6 +18,16 @@ import threading
 
 import config
 from mqtt_client import get_mqtt_manager
+from job_contract import (
+    CODE_MISSING_OUTPUT,
+    CODE_SERVER_INTERNAL,
+    OUTCOME_FILENAME,
+    STATUS_COMPLETE,
+    STATUS_FAILED,
+    STATUS_PARTIAL_SUCCESS,
+    outcome_path,
+    read_outcome,
+)
 from script_preprocessor import save_preprocessed_script
 from freecad_monitor import (
     RESOURCE_LIMIT as RESOURCE_LIMIT_FOR_PEAKS,
@@ -118,12 +128,18 @@ def iter_all_queue_names():
 def find_job_for_user(user_id: str):
     """
     Find a user's job across priority queues and the legacy queue.
-    Search order is started, queued, then finished; each pass scans high to low priority.
+    Search order is started, queued, finished, then failed; each pass scans high
+    to low priority.
+
+    The failed registry is searched too: a worker that dies (OOM, kill, a crash
+    inside its own reporting) never writes an outcome, and without this pass the
+    job would look like it is still running forever.
     """
     registry_getters = (
         lambda q: q.started_job_registry.get_job_ids(),
         lambda q: q.get_job_ids(),
         lambda q: q.finished_job_registry.get_job_ids(),
+        lambda q: q.failed_job_registry.get_job_ids(),
     )
 
     for get_job_ids in registry_getters:
@@ -193,9 +209,15 @@ status_response = api.model('StatusResponse', {
     'status': fields.String(description='Job status'),
     'progress': fields.Integer(description='Completion percentage (0-100)'),
     'message': fields.String(description='Detailed message'),
-    'error': fields.String(description='Error message (if any)'),
+    # `code` and `error` are the job-outcome contract (see job_contract.py).
+    # `error` MUST be Raw: declared as String, flask-restx would stringify the
+    # object and the client would have to parse it back out of a string.
+    'code': fields.String(description='Error code, e.g. "104.1" (null unless the job failed)', required=False),
+    'error': fields.Raw(description='Error object: code, message, specific_exception, hints, tails', required=False),
+    'details': fields.Raw(description='Success/diagnostic details', required=False),
+    'final': fields.Boolean(description='True once the job reached a terminal state', required=False),
     'updated_at': fields.String(description='Update time'),
-    'data_source': fields.String(description='Data source: "mqtt" or "redis"', required=False),
+    'data_source': fields.String(description='Data source: "outcome_file", "mqtt" or "redis"', required=False),
     'mqtt_connected': fields.Boolean(description='MQTT connection status', required=False)
 })
 
@@ -209,8 +231,13 @@ file_info = api.model('FileInfo', {
 
 result_response = api.model('ResultResponse', {
     'user_id': fields.String(description='User ID'),
-    'status': fields.String(description='Job status'),
+    'status': fields.String(
+        description='"success", "partial_success", "failed", "running" or "queued" — '
+                    'the real outcome of the job, not merely whether files exist'
+    ),
     'message': fields.String(description='Message', required=False),
+    'code': fields.String(description='Error code, e.g. "104.1" (null on success)', required=False),
+    'error': fields.Raw(description='Error object (see job_contract.py)', required=False),
     'files': fields.List(fields.Nested(file_info), description='List of generated files'),
     'output_directory': fields.String(description='Output directory (if auto_download is enabled)', required=False),
     'completed_at': fields.String(description='Completion time')
@@ -788,7 +815,20 @@ class GenerateModel(Resource):
             # Create directories if they don't exist
             os.makedirs(input_dir, exist_ok=True)
             os.makedirs(output_dir, exist_ok=True)
-            
+
+            # Forget the previous job for this user before queueing a new one.
+            # user_id IS the job key here, so without this a resubmission would
+            # be answered with the previous run's outcome — /status and /result
+            # would report a verdict that belongs to a job that already ended.
+            try:
+                previous_outcome = outcome_path(output_dir)
+                if os.path.exists(previous_outcome):
+                    os.remove(previous_outcome)
+            except Exception as exc:
+                print(f"[API] ⚠️ Could not clear previous {OUTCOME_FILENAME} for {user_id}: {exc}")
+            mqtt_manager.reset_progress(user_id)
+
+
             # Save script to input/script.py (fixed name)
             script_path = os.path.join(input_dir, "script.py")
             file.save(script_path)
@@ -971,27 +1011,78 @@ class JobStatus(Resource):
     @api.marshal_with(status_response)
     @api.doc('get_job_status')
     def get(self, user_id):
-        """Check job status by user_id with progress from MQTT"""
-        try:
-            # Check MQTT progress first
-            mqtt_progress = mqtt_manager.get_progress(user_id)
-            mqtt_connected = mqtt_manager.connected if hasattr(mqtt_manager, 'connected') else False
+        """Check job status by user_id.
 
+        Sources, in order of authority:
+          1. the outcome file written by the worker — the only one that survives
+             an MQTT outage or a restart of this process, and the only one that
+             carries the failure code;
+          2. an RQ job marked failed — the worker died without reporting, so
+             nobody else will ever say what happened;
+          3. live MQTT progress, while the job is still running;
+          4. the Redis job, if this process never saw an MQTT message at all.
+        """
+        try:
+            mqtt_connected = mqtt_manager.connected if hasattr(mqtt_manager, 'connected') else False
+            output_dir = os.path.join(config.STORAGE_PATH, user_id, "output")
+
+            outcome = read_outcome(output_dir)
+            if outcome:
+                return {
+                    "user_id": user_id,
+                    "status": outcome.get("status", "unknown"),
+                    "progress": outcome.get("progress", 0),
+                    "message": outcome.get("message", ""),
+                    "code": outcome.get("code"),
+                    "error": outcome.get("error"),
+                    "details": outcome.get("details"),
+                    "final": True,
+                    "updated_at": outcome.get("timestamp", iso_now()),
+                    "data_source": "outcome_file",
+                    "mqtt_connected": mqtt_connected
+                }
+
+            # No outcome on disk. If RQ says the job died, report that as the
+            # verdict: the last MQTT sample would otherwise say "running" for
+            # ever and the caller would wait on a job that no longer exists.
+            job = find_job_for_user(user_id)
+            if job is not None and job.get_status() == "failed":
+                message = "The FreeCAD server stopped handling this job before it finished"
+                return {
+                    "user_id": user_id,
+                    "status": STATUS_FAILED,
+                    "progress": 0,
+                    "message": message,
+                    "code": CODE_SERVER_INTERNAL,
+                    "error": {
+                        "code": CODE_SERVER_INTERNAL,
+                        "message": message,
+                        "specific_exception": (job.exc_info or "")[-2000:] or None,
+                    },
+                    "details": None,
+                    "final": True,
+                    "updated_at": iso_now(),
+                    "data_source": "redis_failed_job",
+                    "mqtt_connected": mqtt_connected
+                }
+
+            mqtt_progress = mqtt_manager.get_progress(user_id)
             if mqtt_progress:
                 return {
                     "user_id": user_id,
                     "status": mqtt_progress.get("status", "unknown"),
                     "progress": mqtt_progress.get("progress", 0),
                     "message": mqtt_progress.get("message", ""),
+                    "code": mqtt_progress.get("code"),
                     "error": mqtt_progress.get("error"),
+                    "details": mqtt_progress.get("details"),
+                    "final": bool(mqtt_progress.get("final")),
                     "updated_at": mqtt_progress.get("updated_at", iso_now()),
                     "data_source": "mqtt",
                     "mqtt_connected": mqtt_connected
                 }
 
-            # Fallback to Redis if no MQTT data
-            job = find_job_for_user(user_id)
-
+            # Fallback to Redis if no MQTT data (job already looked up above)
             if job:
                 status = job.get_status()
                 updated_at = iso_now()
@@ -1007,7 +1098,12 @@ class JobStatus(Resource):
                     "status": status,
                     "progress": progress,
                     "message": f"Job {status} (from Redis queue)",
+                    "code": None,
                     "error": None,
+                    "details": None,
+                    # An RQ "finished" only means the function returned; the
+                    # verdict lives in the outcome file, which is not there yet.
+                    "final": False,
                     "updated_at": updated_at,
                     "data_source": "redis",
                     "mqtt_connected": mqtt_connected
@@ -1036,38 +1132,50 @@ class JobResult(Resource):
     @api.marshal_with(result_response)
     @api.doc('get_job_result')
     def get(self, user_id):
-        """Get job result by user_id. Returns files from storage/{user_id}/output/ directory."""
+        """Get job result by user_id.
+
+        Reports the job's real outcome, not merely whether files happen to be on
+        disk: this used to answer `status: "success"` for any user whose output
+        directory existed, including failed jobs and empty directories, which
+        left the client to discover the failure by finding no files.
+        """
         try:
             # ===== PHASE 4: Direct folder access (no Redis loop) =====
             # Access output directory directly
             output_dir = os.path.join(config.STORAGE_PATH, user_id, "output")
-            
-            if not os.path.exists(output_dir):
-                # Check if job is still running or queued across priority queues.
+
+            # The worker's verdict. Absent means the job has not finished yet, or
+            # this is an output directory left by a build older than the outcome
+            # contract.
+            outcome = read_outcome(output_dir) if os.path.exists(output_dir) else None
+
+            if outcome is None:
+                # No verdict: if the job is still in flight, say so (202) rather
+                # than reporting a result that does not exist yet.
                 job = find_job_for_user(user_id)
-                if job:
-                    status = job.get_status()
-                    if status in ("started", "queued"):
-                        response_status = "running" if status == "started" else "queued"
-                        message = (
+                job_status = job.get_status() if job else None
+                if job_status in ("started", "queued"):
+                    running = job_status == "started"
+                    return {
+                        "user_id": user_id,
+                        "status": "running" if running else "queued",
+                        "message": (
                             "Job is still running. Files will be available when complete."
-                            if status == "started"
-                            else "Job is still in queue."
-                        )
-                        return {
-                            "user_id": user_id,
-                            "status": response_status,
-                            "message": message,
-                            "files": [],
-                            "total_files": 0,
-                            "storage_path": f"storage/{user_id}/",
-                            "completed_at": None,
-                        }, 202
-                
-                api.abort(404, {
-                    "message": "Result not found. The job may not have started yet or output directory does not exist.",
-                    "user_id": user_id,
-                })
+                            if running else "Job is still in queue."
+                        ),
+                        "code": None,
+                        "error": None,
+                        "files": [],
+                        "total_files": 0,
+                        "storage_path": f"storage/{user_id}/",
+                        "completed_at": None,
+                    }, 202
+
+                if not os.path.exists(output_dir):
+                    api.abort(404, {
+                        "message": "Result not found. The job may not have started yet or output directory does not exist.",
+                        "user_id": user_id,
+                    })
 
             # List expected files with standardized naming
             expected_files = [
@@ -1075,11 +1183,11 @@ class JobResult(Resource):
                 {"type": "obj", "filename": f"{user_id}.obj"},
                 {"type": "pdf", "filename": f"{user_id}.pdf"}
             ]
-            
+
             # Check each file and create download URLs
             base_url = os.getenv('API_BASE_URL', f'http://{config.API_HOST}:{config.API_PORT}')
             files = []
-            
+
             for file_info in expected_files:
                 file_path = os.path.join(output_dir, file_info["filename"])
                 if os.path.exists(file_path):
@@ -1094,15 +1202,50 @@ class JobResult(Resource):
                         "size": file_size
                     })
             
+            # Map the worker's terminal status onto the wire vocabulary of this
+            # endpoint. "success" is kept for a complete job so existing callers
+            # keep working; the other two are new and carry a code.
+            status_on_the_wire = {
+                STATUS_COMPLETE: "success",
+                STATUS_PARTIAL_SUCCESS: "partial_success",
+                STATUS_FAILED: "failed",
+            }
+
+            if outcome is None:
+                # No verdict on disk but files are there: an output directory
+                # from before this contract existed, or a job whose outcome
+                # could not be written. Report what can be proven — the files —
+                # and say the verdict is unknown rather than inventing success.
+                return {
+                    "user_id": user_id,
+                    "status": "success" if files else "failed",
+                    "message": (
+                        "No job outcome was recorded; reporting the files found on disk."
+                        if files else
+                        "No job outcome was recorded and no output files exist."
+                    ),
+                    "code": None if files else CODE_MISSING_OUTPUT,
+                    "error": None,
+                    "files": files,
+                    "total_files": len(files),
+                    "storage_path": f"storage/{user_id}/",
+                    "completed_at": iso_now(),
+                }
+
             return {
                 "user_id": user_id,
-                "status": "success",
+                "status": status_on_the_wire.get(outcome.get("status"), "failed"),
+                "message": outcome.get("message", ""),
+                "code": outcome.get("code"),
+                "error": outcome.get("error"),
                 "files": files,
                 "total_files": len(files),
                 "storage_path": f"storage/{user_id}/",
-                "completed_at": iso_now(),
+                "completed_at": outcome.get("timestamp", iso_now()),
             }
-            
+
+        except HTTPException:
+            raise
         except Exception as e:
             api.abort(
                 500,
@@ -1158,6 +1301,11 @@ class DownloadFile(Resource):
                 mimetype='application/octet-stream'
             )
 
+        except HTTPException:
+            # api.abort() raises an HTTPException; without this it was caught
+            # just below and re-reported as 500, so a refused file (403) and a
+            # missing one (404) both reached the caller as "internal error".
+            raise
         except Exception as e:
             api.abort(500, f"Download failed: {str(e)}")
 
@@ -1238,6 +1386,8 @@ class DownloadLatestScript(Resource):
                 mimetype='text/x-python'
             )
 
+        except HTTPException:
+            raise
         except Exception as e:
             api.abort(500, f"Download script failed: {str(e)}")
 
@@ -1279,7 +1429,9 @@ class GetPythonScript(Resource):
                 "modified_at": datetime.fromtimestamp(modified_time, tz=timezone.utc).isoformat(),
                 "path": f"storage/{user_id}/input/script.py"
             }
-            
+
+        except HTTPException:
+            raise
         except Exception as e:
             api.abort(500, {
                 "message": f"Error reading Python script: {str(e)}",

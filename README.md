@@ -167,6 +167,42 @@ Workers publish JSON progress to:
 
 `listen_mqtt.py` is a minimal subscriber for debugging.
 
+### Job outcome contract
+
+A job ends in exactly one state, and **this server decides which, and why** — it
+is the only side that saw the failure happen. It names the failure with a code;
+the client (`tolery-api-ai`) turns that code into a message for the end user and
+never guesses from the wording. The contract lives in
+[`job_contract.py`](job_contract.py); the user-facing message for each code
+lives in the client's `src/core/error_codes.py`.
+
+| `status` | `progress` | `code` | Meaning |
+|---|---|---|---|
+| `complete` | 100 | `null` | Every expected file was produced |
+| `partial_success` | 90 | `104.6` | Model produced, an optional export (PDF) is missing |
+| `failed` | 0 | see below | Nothing usable was produced |
+
+Codes emitted here:
+
+| Code | Cause |
+|---|---|
+| `101.1` | `freecadcmd` exceeded `EXEC_TIMEOUT_SECONDS` and was stopped |
+| `104.1` | The generated script raised while running |
+| `104.2` | The generated script hit an encoding error |
+| `104.3` | Execution finished without producing the required CAD output |
+| `104.5` | The server itself failed (bad input, crash, worker died) |
+| `104.6` | An optional export is missing |
+
+The same envelope — `status`, `progress`, `code`, `message`, `error`, `details`
+— is published on MQTT, written to `{output}/_job_outcome.json`, and served by
+`GET /freecad/status/{user_id}` and `GET /freecad/result/{user_id}`. The file on
+disk is what keeps those two endpoints honest when the broker is down, a
+retained message is missed, or the API process restarts.
+
+`error` and `details` are real JSON objects, never JSON encoded into a string:
+anything the reader has to parse back out of a string is lost the first time
+someone wraps it.
+
 ---
 
 ## Configuration
@@ -205,6 +241,7 @@ worker.py                   RQ job: runs the script inside FreeCAD, exports STEP
 config.py                   Environment-backed configuration
 entrypoint.sh               Container init: Redis fallback, N workers, API
 script_preprocessor.py      Normalizes user scripts before execution
+job_contract.py             Job outcome envelope + error codes shared with the API
 mqtt_client.py              Progress/status publisher
 freecad_monitor.py          Resource + job sampling behind /freecad/monitor
 client_user_upload.py       Reference CLI client

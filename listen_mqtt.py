@@ -68,10 +68,21 @@ def on_message(client, userdata, msg):
         
         if message_data.get('message'):
             print(f"{Colors.BLUE}Message:{Colors.RESET} {message_data['message']}")
-        
-        if message_data.get('error'):
-            print(f"{Colors.RED}Error:{Colors.RESET} {message_data['error']}")
-        
+
+        # Outcome envelope (job_contract.py): `code` names the failure, `error`
+        # is an object with the technical cause.
+        if message_data.get('code'):
+            print(f"{Colors.RED}Code:{Colors.RESET} {Colors.BOLD}{message_data['code']}{Colors.RESET}")
+
+        error = message_data.get('error')
+        if isinstance(error, dict):
+            for key in ('meaning', 'specific_exception', 'error_hint'):
+                if error.get(key):
+                    print(f"{Colors.RED}{key}:{Colors.RESET} {error[key]}")
+        elif error:
+            print(f"{Colors.RED}Error:{Colors.RESET} {error}")
+
+
         # Hiển thị progress bar
         progress = message_data.get('progress', 0)
         bar_length = 50
