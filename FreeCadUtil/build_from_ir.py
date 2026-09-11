@@ -14,9 +14,11 @@ solid and writes the same artefacts the legacy generated scripts wrote:
 Geometry rules live in ir_frames.py (pure python, shared with the API side);
 this file only turns frames into Part shapes:
 
-    blank  : Part.Face -> extrude              (rect / stadium / disc / polygon)
+    blank  : Part.Face -> extrude              (rect / stadium / disc or sector / polygon)
     bends  : SheetMetal SMBendWall, one call per group of identical bends on the
-             same parent (AutoMiter closes CAPOT corners, like makeTub did)
+             same parent (AutoMiter closes CAPOT corners, like makeTub did);
+             SheetMetal fold-on-a-line for bend lines across the blank (disc L/U/Z);
+             revolved profile for a rim all around a disc (round cover, collar neck)
     feature: tool built in the face's local (u, v, n) frame, moved with a Matrix,
              all tools cut in one compound cut (per-tool fallback if that fails)
 
@@ -69,7 +71,10 @@ def _frame_matrix(face):
 
 
 def _bbox(shape):
-    b = shape.BoundBox
+    try:
+        b = shape.optimalBoundingBox(True, False)   # revolved surfaces get a loose BoundBox otherwise
+    except Exception:
+        b = shape.BoundBox
     return [round(b.XMin, 3), round(b.XMax, 3), round(b.YMin, 3), round(b.YMax, 3), round(b.ZMin, 3), round(b.ZMax, 3)]
 
 
@@ -122,10 +127,21 @@ def make_blank(ir, plan):
     if blank["type"] == "stadium":
         return makeOblong(blank["x"], blank["y"], t, App.Vector(0, 0, 0), App.Vector(0, 0, 1))
     if blank["type"] == "disc":
+        if plan.rims:
+            return make_rim_solid(ir, plan)
         R = blank["diameter"] / 2.0
-        solid = Part.makeCylinder(R, t, App.Vector(R, R, 0), App.Vector(0, 0, 1))
+        cx, cy = blank["center"]
+        arc = blank["arc"]
+        centre, axis = App.Vector(cx, cy, 0), App.Vector(0, 0, 1)
+        solid = Part.makeCylinder(R, t, centre, axis, arc) if arc < 360.0 - 1e-9 else Part.makeCylinder(R, t, centre, axis)
         if blank.get("inner_diameter"):
-            solid = solid.cut(Part.makeCylinder(blank["inner_diameter"] / 2.0, t + 2 * MARGIN, App.Vector(R, R, -MARGIN), App.Vector(0, 0, 1)))
+            solid = solid.cut(Part.makeCylinder(blank["inner_diameter"] / 2.0, t + 2 * MARGIN, App.Vector(cx, cy, -MARGIN), axis))
+        # a flange on the straight edge of a half / quarter disc consumes s_corner of the blank at that edge
+        big = 4.0 * R + 10.0
+        if base.shrink["v-"] > 0:
+            solid = solid.cut(Part.makeBox(big, base.shrink["v-"] + MARGIN, t + 2 * MARGIN, App.Vector(-R - MARGIN, -MARGIN, -MARGIN)))
+        if base.shrink["u-"] > 0:
+            solid = solid.cut(Part.makeBox(base.shrink["u-"] + MARGIN, big, t + 2 * MARGIN, App.Vector(-MARGIN, -R - MARGIN, -MARGIN)))
         return solid
     if blank["type"] == "polygon":
         pts = F.shrink_polygon(base.poly, {k: v for k, v in base.shrink.items() if k.startswith("e")})
@@ -133,6 +149,65 @@ def make_blank(ir, plan):
         face = Part.Face(Part.makePolygon(vecs + [vecs[0]]))
         return face.extrude(App.Vector(0, 0, t))
     raise BuildError("unknown blank type %r" % blank["type"])
+
+
+def _revolved_profile_faces(ir, plan, w):
+    """Bend arc + flange of a rim wall as faces in the half-plane through the disc axis (y = cy, x >= cx)."""
+    t = ir["thickness"]
+    b = w.bend
+    cx, cy = b["center"]
+    r_b = max(float(b["radius"]), 0.05)
+    rho = float(b["rho"])
+    d = -1.0 if b["invert"] else 1.0
+    outward = 1.0 if b["rim"] == "outer" else -1.0
+    x0 = b["x0"]
+    Cz = t + r_b if d > 0 else -r_b
+    v0 = -90.0 if d > 0 else 90.0
+    sweep = outward * d
+    v1 = v0 + sweep * rho
+
+    def P(rad, ang):
+        a = math.radians(ang)
+        return App.Vector(cx + x0 + rad * math.cos(a), cy, Cz + rad * math.sin(a))
+
+    mid = (v0 + v1) / 2.0
+    arc = Part.Face(Part.Wire([Part.LineSegment(P(r_b, v0), P(r_b + t, v0)).toShape(),
+                               Part.Arc(P(r_b + t, v0), P(r_b + t, mid), P(r_b + t, v1)).toShape(),
+                               Part.LineSegment(P(r_b + t, v1), P(r_b, v1)).toShape(),
+                               Part.Arc(P(r_b, v1), P(r_b, mid), P(r_b, v0)).toShape()]))
+    a1 = math.radians(v1)
+    direction = App.Vector(-math.sin(a1) * sweep, 0.0, math.cos(a1) * sweep)
+    p_in, p_out = P(r_b, v1), P(r_b + t, v1)
+    flap = Part.Face(Part.makePolygon([p_in, p_out, p_out + direction * b["flat"], p_in + direction * b["flat"], p_in]))
+    return arc, flap
+
+
+def make_rim_solid(ir, plan):
+    """Disc with a flange all around its edge (round cover / cup) and/or around its bore (collar neck):
+    flat annulus + revolved bend arc + revolved flange, one solid."""
+    t = ir["thickness"]
+    blank = ir["blank"]
+    R = blank["diameter"] / 2.0
+    cx, cy = blank["center"]
+    A, Z = App.Vector(cx, cy, 0), App.Vector(0, 0, 1)
+    ro, ri = R, (blank.get("inner_diameter") or 0.0) / 2.0
+    walls = [plan.faces[n] for n in plan.rims]
+    for w in walls:
+        if w.bend["rim"] == "outer":
+            ro = w.bend["x0"]
+        else:
+            ri = w.bend["x0"]
+    solid = Part.makeCylinder(ro, t, A, Z)
+    if ri > 0:
+        solid = solid.cut(Part.makeCylinder(ri, t + 2 * MARGIN, A - Z * MARGIN, Z))
+    parts = []
+    for w in walls:
+        for face in _revolved_profile_faces(ir, plan, w):
+            parts.append(face.revolve(A, Z, 360.0))
+    solid = solid.fuse(parts) if parts else solid
+    if not solid.isValid() or len(solid.Solids) != 1:
+        raise BuildError("the rim could not be joined to the disc")
+    return solid.removeSplitter()
 
 
 # ---------------------------------------------------------------- bends
@@ -159,6 +234,9 @@ def _base_edge_points(ir, plan, wall):
             i = int(wall.edge_of_parent[1:])
             q1, q2 = pts[i], pts[(i + 1) % len(pts)]
             return (q1[0], q1[1], t), (q2[0], q2[1], t)
+        if blank["type"] == "disc":           # straight edge of a half / quarter disc
+            p1, p2 = F.disc_edge_span(blank, wall.edge_of_parent, parent.shrink)
+            return (p1[0], p1[1], t), (p2[0], p2[1], t)
         raise BuildError("bends on a %s blank are not supported" % blank["type"])
     # child of a wall: tip edge on the parent's inner surface
     vt = parent.V - parent.shrink["v+"]
@@ -198,6 +276,133 @@ def _find_edge_on_segment(shape, p1, p2, tol=EDGE_TOL):
         if score < best_score:
             best, best_score = "Edge%d" % i, score
     return best
+
+
+def _top_face_name(shape, t):
+    """Largest planar face lying on z = t with its normal up: the flat top the fold line is drawn on."""
+    best, area = None, -1.0
+    for i, f in enumerate(shape.Faces, 1):
+        if f.Surface.__class__.__name__ != "Plane":
+            continue
+        if f.normalAt(0, 0).z > 0.95 and abs(f.CenterOfMass.z - t) < 1e-3 and f.Area > area:
+            best, area = "Face%d" % i, f.Area
+    return best
+
+
+def apply_folds(doc, solid, ir, plan):
+    """Bend lines ACROSS the blank (disc L / U / Z, folded plates): SheetMetal fold on a line.
+
+    The flat part on the centre side stays where it is, the material beyond the line
+    becomes the flange (bend zone of K = 0.5 starting at x0, like SMBendWall).  Which
+    side SheetMetal keeps fixed depends on its internal split order, so the result is
+    probed and the fold redone with `invertbend` when the wrong half moved.
+    """
+    if not plan.folds:
+        return solid, None
+    if not _ensure_sheetmetal():
+        raise BuildError("SheetMetal workbench not available")
+    from sheetmetal.SheetMetalFoldCmd import SMFoldWall
+    t = ir["thickness"]
+    blank = ir["blank"]
+    current = doc.addObject("Part::Feature", "FoldBlank")
+    current.Shape = solid
+    doc.recompute()
+    bb = solid.BoundBox
+    L = bb.DiagonalLength + 50.0
+    for i, name in enumerate(plan.folds):
+        b = plan.faces[name].bend
+        x0, axis, sign = b["x0"], b["axis"], b["sign"]
+        # probe = centroid of the flat (fixed) region, well away from the bend zone
+        fixed = F.clip_halfplane(F.blank_outline(blank), axis, x0, -sign)
+        for other in plan.folds:                                   # earlier / later folds also leave the middle flat
+            ob = plan.faces[other].bend
+            if other != name:
+                fixed = F.clip_halfplane(fixed, ob["axis"], ob["x0"], -ob["sign"])
+        pc = F.polygon_centroid(fixed)
+        probe = App.Vector(pc[0], pc[1], t / 2.0)
+        if axis == "x":
+            line = Part.LineSegment(App.Vector(x0, bb.Center.y - L, t), App.Vector(x0, bb.Center.y + L, t)).toShape()
+        else:
+            line = Part.LineSegment(App.Vector(bb.Center.x - L, x0, t), App.Vector(bb.Center.x + L, x0, t)).toShape()
+        fname = _top_face_name(current.Shape, t)
+        if not fname:
+            raise BuildError("cannot find the flat top face for the fold %r" % name)
+        lo = doc.addObject("Part::Feature", "FoldLine%d" % (i + 1))
+        lo.Shape = line
+        fo = doc.addObject("Part::FeaturePython", "Fold%d" % (i + 1))
+        SMFoldWall(fo, current, [fname], lo)
+        fo.radius = float(b["radius"])
+        fo.angle = float(b["rho"])
+        fo.kfactor = 0.5
+        fo.Position = "forward"
+        fo.invert = bool(b["invert"])
+        fo.invertbend = False
+        doc.recompute()
+        shp = fo.Shape
+        if shp.isNull() or not shp.isInside(probe, 1e-6, True):
+            fo.invertbend = True
+            doc.recompute()
+            shp = fo.Shape
+        if shp.isNull() or not shp.isValid() or len(shp.Solids) != 1 or not shp.isInside(probe, 1e-6, True):
+            raise BuildError("fold %r produced an invalid shape" % name)
+        current = fo
+    return current.Shape, current
+
+
+def _manual_wall(ir, wall):
+    """Bend arc + flat flange on a straight edge, built as solids in the wall's own frame.
+
+    Local frame: u along the edge, o = outward from the parent, n = into the parent's material
+    (the parent's outer surface is n = 0, the outside sharp corner is o = 0).
+    """
+    t = ir["thickness"]
+    b = wall.bend
+    r = max(float(b["radius"]), 0.05)
+    rho = float(b["rho"])
+    rr = math.radians(rho)
+    # the wall frame gives v (along the flange) and n (into the flange); recover the parent's o and n
+    cos_r, sin_r = math.cos(rr), math.sin(rr)
+    o_hat = V(F.v_add(F.v_mul(wall.v, cos_r), F.v_mul(wall.n, -sin_r)))
+    n_par = V(F.v_add(F.v_mul(wall.v, sin_r), F.v_mul(wall.n, cos_r)))
+    u_hat = V(wall.u)
+    O = V(wall.origin)
+
+    def P(o, n):
+        return O + o_hat * o + n_par * n
+
+    s_c = b["s_corner"]
+    C = (-s_c, t + r)
+    a0, a1 = -math.pi / 2.0, -math.pi / 2.0 + rr
+
+    def arc_pt(rad, a):
+        return P(C[0] + rad * math.cos(a), C[1] + rad * math.sin(a))
+
+    mid = (a0 + a1) / 2.0
+    arc_face = Part.Face(Part.Wire([Part.LineSegment(arc_pt(r, a0), arc_pt(r + t, a0)).toShape(),
+                                    Part.Arc(arc_pt(r + t, a0), arc_pt(r + t, mid), arc_pt(r + t, a1)).toShape(),
+                                    Part.LineSegment(arc_pt(r + t, a1), arc_pt(r, a1)).toShape(),
+                                    Part.Arc(arc_pt(r, a1), arc_pt(r, mid), arc_pt(r, a0)).toShape()]))
+    parts = [arc_face.extrude(u_hat * wall.U)]
+    flat = b["sm_length"]
+    if flat > 1e-6:
+        d = (-math.sin(a1), math.cos(a1))
+        p_in, p_out = arc_pt(r, a1), arc_pt(r + t, a1)
+        step = o_hat * (d[0] * flat) + n_par * (d[1] * flat)
+        flap = Part.Face(Part.makePolygon([p_in, p_out, p_out + step, p_in + step, p_in]))
+        parts.append(flap.extrude(u_hat * wall.U))
+    return parts
+
+
+def add_manual_walls(shape, ir, plan):
+    if not plan.manual_walls:
+        return shape
+    parts = []
+    for name in plan.manual_walls:
+        parts.extend(_manual_wall(ir, plan.faces[name]))
+    fused = shape.fuse(parts)
+    if not fused.isValid() or len(fused.Solids) != 1:
+        raise BuildError("the flange(s) %s could not be joined to the plate" % (plan.manual_walls,))
+    return fused.removeSplitter()
 
 
 def apply_bends(doc, base_solid, ir, plan):
@@ -299,6 +504,8 @@ def make_tools(ir, plan, sheet=True):
             continue
         if face.kind == "tube_round":
             tool = _round_tube_tool(ir, inst)
+        elif face.kind == "rim":
+            tool = _rim_tool(ir, plan, inst)
         else:
             local_t = t
             if face.kind == "edge":
@@ -311,7 +518,12 @@ def make_tools(ir, plan, sheet=True):
             tool = _local_tool(inst, local_t)
             tool = tool.transformShape(_frame_matrix(face)) if hasattr(tool, "transformShape") else tool.transformGeometry(_frame_matrix(face))
         tools.append(tool)
-        p = face.point(inst["u"], inst["v"]) if face.kind != "tube_round" else None
+        if face.kind == "tube_round":
+            p = None
+        elif face.kind == "rim":
+            p = _rim_point(face, inst["u"], inst["v"])
+        else:
+            p = face.point(inst["u"], inst["v"])
         if f["type"] == "thread":
             meta["threaded_holes"].append({"thread_type": f["thread"], "diameter": round(f["diameter"], 3), "pitch": f.get("pitch"),
                                            "face": face.name, "position": {"x": p[0], "y": p[1], "z": p[2]} if p else None,
@@ -327,6 +539,26 @@ def make_tools(ir, plan, sheet=True):
         elif f["type"] in ("rect", "keyhole"):
             meta["rects"].append({"type": f["type"], "size": f["size"], "face": face.name})
     return tools, meta
+
+
+def _rim_point(face, u, v):
+    """3D point on a rim wall: u = distance along the circumference from +x, v = height from the bend."""
+    cx, cy = face.bend["center"]
+    a = u / face.bend["R_edge"]
+    p = face.point(0.0, v)
+    dx, dy = p[0] - cx, p[1] - cy
+    return (cx + dx * math.cos(a) - dy * math.sin(a), cy + dx * math.sin(a) + dy * math.cos(a), p[2])
+
+
+def _rim_tool(ir, plan, inst):
+    """Tool on a rim wall: built at angle 0 in the wall frame, then turned around the disc axis."""
+    face = plan.faces[inst["face"]]
+    cx, cy = face.bend["center"]
+    loc = dict(inst)
+    loc["u"] = 0.0
+    tool = _local_tool(loc, ir["thickness"]).transformShape(_frame_matrix(face))
+    tool.rotate(App.Vector(cx, cy, 0), App.Vector(0, 0, 1), math.degrees(inst["u"] / face.bend["R_edge"]))
+    return tool
 
 
 def _round_tube_tool(ir, inst):
@@ -552,7 +784,9 @@ def build(ir, doc=None):
     else:
         blank = make_blank(ir, plan)
         report["blank_volume"] = round(blank.Volume, 3)
-        shape, bend_obj = apply_bends(doc, blank, ir, plan)
+        shape, _fold_obj = apply_folds(doc, blank, ir, plan)
+        shape, bend_obj = apply_bends(doc, shape, ir, plan)
+        shape = add_manual_walls(shape, ir, plan)
     tools, meta = make_tools(ir, plan)
     shape, failed = cut_all(shape, tools)
     meta["failed"] = failed

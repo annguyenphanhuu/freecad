@@ -89,9 +89,20 @@ EDGE_ALIASES = {
 # on a wall the child bend can only hang from the tip in v1
 WALL_EDGE_ALIASES = {"tip": "tip", "v+": "tip", "free": "tip", "top": "tip", "end": "tip", "far": "tip"}
 
-TRIANGLE_EDGE_ALIASES = {"e0": "e0", "base": "e0", "ab": "e0", "bottom": "e0",
-                         "e1": "e1", "hypotenuse": "e1", "bc": "e1", "right": "e1", "slanted": "e1",
-                         "e2": "e2", "ca": "e2", "left": "e2"}
+TRIANGLE_EDGE_ALIASES = {"e0": "e0", "base": "e0", "ab": "e0", "bottom": "e0", "first_leg": "e0", "leg1": "e0", "leg_a": "e0",
+                         "e1": "e1", "hypotenuse": "e1", "bc": "e1", "right": "e1", "slanted": "e1", "long": "e1", "longest": "e1",
+                         "e2": "e2", "ca": "e2", "left": "e2", "second_leg": "e2", "leg2": "e2", "leg_b": "e2"}
+# a straight bend line ACROSS the blank (disc L/U/Z, folded plates): flat part on one side, flange on the other
+FOLD_WORDS = ("fold", "fold_line", "line", "chord", "bend_line", "across", "offset", "middle", "center", "centre", "diameter_line", "")
+# flange all around a disc (round cover / cup), or around the bore of a ring (collar neck)
+RIM_WORDS = ("rim", "perimeter", "circumference", "outer", "outer_edge", "all_around", "around", "border", "periphery",
+             "outside", "edge", "outer_rim", "circular_edge", "round_edge", "skirt")
+INNER_RIM_WORDS = ("inner_rim", "inner", "bore", "inner_edge", "hole", "inside", "neck", "collar", "spigot", "central_hole", "inner_circle")
+# straight edges of a half disc (arc 180) / quarter disc (arc 90)
+SECTOR_EDGE_ALIASES = {"y-": "y-", "diameter": "y-", "flat": "y-", "straight": "y-", "straight_edge": "y-", "flat_edge": "y-",
+                       "front": "y-", "bottom": "y-", "base": "y-", "chord": "y-", "x-": "x-", "left": "x-", "vertical": "x-", "side": "x-"}
+REGULAR_POLYGONS = {"pentagon": 5, "hexagon": 6, "hexagonal": 6, "heptagon": 7, "octagon": 8, "octagonal": 8,
+                    "regular_polygon": 0, "regular": 0}
 
 ROUND_TYPES = ("hole", "hex", "thread", "countersink", "counterbore", "blind_hole", "boss")
 BOX_TYPES = ("slot", "rect", "window", "keyhole")
@@ -243,30 +254,41 @@ def normalize_ir(ir):
         blank["type"] = "rect"
         blank["x"] = _num(blank.get("x"), "blank.x (length)")
         blank["y"] = _num(blank.get("y"), "blank.y (width)")
-    elif btype in ("disc", "disk", "circle", "circular", "round"):
+    elif btype in ("disc", "disk", "circle", "circular", "round", "ring", "annulus", "half_disc", "semicircle", "semi_disc",
+                   "half_moon", "quarter_disc", "quarter_circle", "sector"):
         blank["type"] = "disc"
-        blank["diameter"] = _num(blank.get("diameter"), "blank.diameter")
-        blank["inner_diameter"] = _num(blank.get("inner_diameter"), "blank.inner_diameter", allow_none=True)
-        if blank["inner_diameter"] and blank["inner_diameter"] >= blank["diameter"]:
-            raise IRError("inner diameter must be smaller than the outer diameter")
-    elif btype in ("ring", "annulus"):
-        blank["type"] = "disc"
-        blank["diameter"] = _num(blank.get("diameter"), "blank.diameter")
+        blank["diameter"] = _num(blank.get("diameter") or (2.0 * float(blank["radius"]) if blank.get("radius") else None), "blank.diameter")
         inner = blank.get("inner_diameter")
         if inner is None and blank.get("band_width") is not None:
             inner = blank["diameter"] - 2.0 * float(blank["band_width"])
-        blank["inner_diameter"] = _num(inner, "blank.inner_diameter")
+        blank["inner_diameter"] = _num(inner, "blank.inner_diameter", allow_none=(btype not in ("ring", "annulus")))
+        if blank["inner_diameter"] and blank["inner_diameter"] >= blank["diameter"]:
+            raise IRError("inner diameter must be smaller than the outer diameter")
+        arc = blank.get("arc", blank.get("arc_angle", blank.get("sector_angle")))
+        if arc is None:
+            arc = {"half_disc": 180, "semicircle": 180, "semi_disc": 180, "half_moon": 180, "quarter_disc": 90, "quarter_circle": 90}.get(btype, 360)
+        if isinstance(arc, str):
+            arc = {"full": 360, "half": 180, "semi": 180, "semicircle": 180, "quarter": 90}.get(arc.strip().lower(), arc)
+        arc = _num(arc, "blank.arc (degrees of the circular sector)")
+        if arc > 360.0 + 1e-9:
+            raise IRError("blank.arc must be at most 360 degrees")
+        blank["arc"] = 360.0 if arc >= 359.999 else arc
+        blank["center"], blank["bbox"] = sector_geometry(blank["diameter"] / 2.0, blank["arc"])
     elif btype in ("stadium", "oblong", "slot"):
         blank["type"] = "stadium"
         blank["x"] = _num(blank.get("x"), "blank.x (total length)")
         blank["y"] = _num(blank.get("y"), "blank.y (width)")
         if blank["y"] > blank["x"]:
             blank["x"], blank["y"] = blank["y"], blank["x"]
-    elif btype in ("polygon", "triangle"):
+    elif btype in ("polygon", "triangle") or btype in REGULAR_POLYGONS:
         pts = blank.get("points")
         if not pts and btype == "triangle":
             pts = triangle_points(blank.get("triangle") or blank)
             blank["points"] = pts
+        elif not pts and btype in REGULAR_POLYGONS:
+            n = REGULAR_POLYGONS[btype] or int(blank.get("sides") or blank.get("n") or 0)
+            pts, af = regular_polygon_points(n, blank)
+            blank["points"], blank["regular"], blank["across_flats"] = pts, n, af
         if not pts or len(pts) < 3:
             raise IRError("polygon blank needs at least 3 points")
         blank["points"] = [(float(p[0]), float(p[1])) for p in pts]
@@ -297,9 +319,50 @@ def normalize_ir(ir):
         parent = str(b.get("on") or "base").strip().lower().replace(" ", "_")
         if parent not in faces:
             raise IRError("bend %r hangs from unknown face %r" % (name, parent))
-        edge = str(b.get("edge") or "").strip().lower()
+        raw_edge = str(b.get("edge") or "").strip().lower()
+        edge = raw_edge if raw_edge in ("x-", "x+", "y-", "y+") else raw_edge.replace(" ", "_").replace("-", "_")
+        b["axis"], b["sign"] = None, None
         if parent == "base":
-            if blank["type"] == "rect" or blank["type"] == "stadium":
+            is_fold = b.get("offset") is not None or edge in FOLD_WORDS or edge.startswith("fold")
+            if blank["type"] == "disc" and blank["arc"] >= 360.0 and edge in RIM_WORDS:
+                edge = "rim"
+            elif blank["type"] == "disc" and blank["arc"] >= 360.0 and edge in INNER_RIM_WORDS:
+                if not blank.get("inner_diameter"):
+                    raise IRError("bend %r: an inner rim needs a ring blank (inner_diameter)" % name)
+                edge = "inner_rim"
+            elif blank["type"] == "disc" and blank["arc"] < 360.0 and edge in SECTOR_EDGE_ALIASES and b.get("offset") is None:
+                edge = SECTOR_EDGE_ALIASES[edge]
+                if edge == "x-" and blank["arc"] > 90.0 + 1e-6:
+                    raise IRError("bend %r: only a quarter disc has a straight left edge" % name)
+                if blank["arc"] not in (90.0, 180.0):
+                    raise IRError("bend %r: flanges on the straight edge are only supported on a half or quarter disc" % name)
+            elif is_fold or (blank["type"] == "disc" and edge not in EDGE_ALIASES):
+                # a straight bend line across the blank; the flange is the part beyond it
+                edge = "fold"
+                axis, sign = "x", 1
+                side = str(b.get("side") or b.get("toward") or b.get("flange_side") or "").strip().lower()
+                if side in EDGE_ALIASES:
+                    e = EDGE_ALIASES[side]
+                    axis, sign = e[0], (1 if e[1] == "+" else -1)
+                ax = str(b.get("axis") or "").strip().lower()
+                if ax in ("y", "v", "width", "y-", "y+"):
+                    axis = "y"
+                elif ax in ("x", "u", "length", "x-", "x+"):
+                    axis = "x"
+                off = b.get("offset")
+                if off is not None:
+                    # the sign of the offset names the half that folds (negative = the x-/y- half); it wins over
+                    # any side word so that a normalised IR re-normalises to the same part
+                    off = _num(off, "bend %r offset" % name, positive=False)
+                    if off < 0:
+                        sign = -1
+                    elif not side and str(b.get("side_of_centre") or "").lower() in ("-", "negative", "left", "front"):
+                        sign = -1
+                    off = sign * abs(off)
+                b["offset"], b["axis"], b["sign"] = off, axis, sign
+                if off is None and b.get("length") is None:
+                    raise IRError("bend %r needs 'offset' (distance from the centre to the outside of the flange) or 'length' (flange height)" % name)
+            elif blank["type"] in ("rect", "stadium"):
                 if edge not in EDGE_ALIASES:
                     raise IRError("bend %r: unknown base edge %r" % (name, b.get("edge")))
                 edge = EDGE_ALIASES[edge]
@@ -311,19 +374,15 @@ def normalize_ir(ir):
                     pass
                 else:
                     raise IRError("bend %r: unknown polygon edge %r" % (name, b.get("edge")))
-            elif blank["type"] == "disc":
-                # a fold line across the disc, offset from the centre along x
-                if b.get("offset") is None:
-                    raise IRError("bend %r on a disc needs 'offset' (fold line distance from centre)" % name)
-                edge = "chord"
-                b["offset"] = float(b["offset"])
+            else:
+                raise IRError("bend %r: unknown edge %r on a %s blank" % (name, b.get("edge"), blank["type"]))
         else:
             if edge in ("", None) or edge in WALL_EDGE_ALIASES:
                 edge = "tip"
             else:
                 raise IRError("bend %r: a bend on a wall can only hang from its tip edge, got %r" % (name, b.get("edge")))
         b["name"], b["on"], b["edge"] = name, parent, edge
-        b["length"] = _num(b.get("length"), "bend %r length" % name)
+        b["length"] = _num(b.get("length"), "bend %r length" % name, allow_none=(edge == "fold"))
         ang = b.get("angle")
         ang = 90.0 if ang is None else float(ang)
         if ang < 0 or ang >= 180:
@@ -352,13 +411,22 @@ def normalize_ir(ir):
         b["radius"] = _num(b.get("radius"), "bend %r radius" % name, allow_none=True) or ir["bend_radius"]
         faces.add(name)
         bends.append(b)
-    # one bend per (parent, edge)
+    # one bend per (parent, edge); a fold is identified by its axis and side
     seen = set()
     for b in bends:
-        key = (b["on"], b["edge"], b.get("offset"))
+        key = (b["on"], b["edge"], b.get("axis"), b.get("sign"))
         if key in seen:
             raise IRError("two bends on the same edge %r of %r" % (b["edge"], b["on"]))
         seen.add(key)
+    kinds = {b["edge"] for b in bends if b["on"] == "base"}
+    if kinds & {"rim", "inner_rim"} and kinds - {"rim", "inner_rim"}:
+        raise IRError("a rim all around the disc cannot be combined with other bends on the same plate")
+    by_name = {b["name"]: b for b in bends}
+    for b in bends:
+        if b["on"] != "base":
+            pe = by_name[b["on"]]["edge"]
+            if pe in ("rim", "inner_rim") or (pe == "fold" and blank["type"] != "rect"):
+                raise IRError("bend %r: a return bend on a curved flange is not supported" % b["name"])
     ir["bends"] = bends
     # inside footprint -> outside: one wall thickness per bent base edge
     if blank["type"] == "rect" and blank["dims"] == "inside" and not blank.get("_converted"):
@@ -369,10 +437,14 @@ def normalize_ir(ir):
         blank["_converted"] = True
 
     # ---- features
-    base_bends = [b["edge"] for b in bends if b["on"] == "base" and b["edge"] in _SAME]
+    def _pseudo_edge(b):
+        if b["edge"] == "fold":
+            return b["axis"] + ("+" if b["sign"] > 0 else "-")
+        return b["edge"]
+    base_bends = [_pseudo_edge(b) for b in bends if b["on"] == "base" and _pseudo_edge(b) in _SAME]
     along = {}
     for b in bends:
-        along[b["name"]] = b["edge"] if b["on"] == "base" else along.get(b["on"])
+        along[b["name"]] = _pseudo_edge(b) if b["on"] == "base" else along.get(b["on"])
     feats = []
     for i, f in enumerate(ir.get("features") or []):
         f = dict(f)
@@ -719,6 +791,168 @@ def triangle_points(spec):
     raise IRError("unknown triangle kind %r" % kind)
 
 
+def regular_polygon_points(n, spec):
+    """Regular n-gon with a flat at the bottom (y-) and top; (points, across_flats)."""
+    if n < 3:
+        raise IRError("a regular polygon needs at least 3 sides ('sides')")
+    g = lambda *ks: next((float(spec[k]) for k in ks if spec.get(k) is not None), None)
+    af = g("across_flats", "af", "inscribed_diameter", "width")
+    rc = g("circumradius", "circumscribed_radius")
+    dc = g("circumscribed_diameter", "diameter", "across_corners")
+    s = g("side", "side_length", "edge")
+    if af is not None:
+        Rc = af / (2.0 * math.cos(math.pi / n))
+    elif rc is not None:
+        Rc = rc
+    elif dc is not None:
+        Rc = dc / 2.0
+    elif s is not None:
+        Rc = s / (2.0 * math.sin(math.pi / n))
+    else:
+        raise IRError("regular polygon needs across_flats, circumscribed diameter or side")
+    if Rc <= 0:
+        raise IRError("regular polygon size must be > 0")
+    pts = []
+    for k in range(n):
+        a = math.radians(-90.0 + 180.0 / n + k * 360.0 / n)
+        pts.append((Rc * math.cos(a), Rc * math.sin(a)))
+    return pts, 2.0 * Rc * math.cos(math.pi / n)
+
+
+def sector_geometry(R, arc):
+    """Centre (in bbox coordinates, bbox origin at 0,0) and bbox size (X, Y) of a circular sector of
+    radius R spanning angles [0, arc] counter-clockwise from +x.  A full disc gives centre (R, R)."""
+    angles = [0.0, arc] + [a for a in (90.0, 180.0, 270.0) if a < arc - 1e-9]
+    pts = [(R * math.cos(math.radians(a)), R * math.sin(math.radians(a))) for a in angles]
+    if arc < 360.0 - 1e-9:
+        pts.append((0.0, 0.0))
+    xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+    minx, maxx, miny, maxy = min(xs), max(xs), min(ys), max(ys)
+    if arc >= 360.0 - 1e-9:
+        minx, maxx, miny, maxy = -R, R, -R, R
+    return (round(-minx, 9), round(-miny, 9)), (round(maxx - minx, 9), round(maxy - miny, 9))
+
+
+def blank_outline(blank, n_arc=90):
+    """Polygonal approximation of the blank outline in bbox coordinates (CCW)."""
+    bt = blank["type"]
+    if bt == "rect":
+        X, Y = blank["x"], blank["y"]
+        return [(0.0, 0.0), (X, 0.0), (X, Y), (0.0, Y)]
+    if bt == "stadium":
+        X, Y = blank["x"], blank["y"]
+        r = Y / 2.0
+        pts = []
+        for i in range(n_arc // 2 + 1):        # right cap, -90 -> +90
+            a = math.radians(-90.0 + 180.0 * i / (n_arc // 2))
+            pts.append((X - r + r * math.cos(a), r + r * math.sin(a)))
+        for i in range(n_arc // 2 + 1):        # left cap, 90 -> 270
+            a = math.radians(90.0 + 180.0 * i / (n_arc // 2))
+            pts.append((r + r * math.cos(a), r + r * math.sin(a)))
+        return pts
+    if bt == "disc":
+        R, arc = blank["diameter"] / 2.0, blank["arc"]
+        cx, cy = blank["center"]
+        steps = max(8, int(n_arc * arc / 360.0))
+        pts = [(cx + R * math.cos(math.radians(arc * i / steps)), cy + R * math.sin(math.radians(arc * i / steps))) for i in range(steps + (0 if arc >= 360.0 - 1e-9 else 1))]
+        if arc < 360.0 - 1e-9:
+            pts.append((cx, cy))
+        return pts
+    return list(blank["points"])
+
+
+def clip_halfplane(pts, axis, x_cut, sign):
+    """Part of polygon pts with coordinate (x if axis=='x' else y) on the `sign` side of x_cut."""
+    k = 0 if axis == "x" else 1
+    inside = lambda p: (p[k] - x_cut) * sign >= -1e-9
+    out = []
+    n = len(pts)
+    for i in range(n):
+        p, q = pts[i], pts[(i + 1) % n]
+        pin, qin = inside(p), inside(q)
+        if pin:
+            out.append(p)
+        if pin != qin:
+            f = (x_cut - p[k]) / (q[k] - p[k])
+            out.append((p[0] + f * (q[0] - p[0]), p[1] + f * (q[1] - p[1])))
+    return out
+
+
+def flap_span(blank, axis, x1, sign):
+    """(start, extent) along the OTHER axis of the blank material beyond x1 on the `sign` side."""
+    part = clip_halfplane(blank_outline(blank), axis, x1, sign)
+    if len(part) < 3:
+        raise IRError("the fold line leaves no material for the flange")
+    k = 1 if axis == "x" else 0
+    vals = [p[k] for p in part]
+    return min(vals), max(vals) - min(vals)
+
+
+def disc_edge_span(blank, edge, shrink):
+    """End points (in bbox coords) of the straight edge of a half / quarter disc where its flange starts.
+
+    The flange keeps the full edge length (the arc next to it is not bent); the other straight edge
+    of a quarter disc trims it only when that edge is bent too (the two flanges then meet).
+    """
+    R, arc = blank["diameter"] / 2.0, blank["arc"]
+    cx, cy = blank["center"]
+    su, sv = shrink.get("u-", 0.0), shrink.get("v-", 0.0)
+    if edge == "y-":
+        x_lo = cx - R if arc > 90.0 + 1e-6 else su
+        return (x_lo, sv), (cx + R, sv)
+    # x- edge (quarter disc only)
+    return (su, sv), (su, cy + R)
+
+
+def polygon_centroid(pts):
+    a = cx = cy = 0.0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        cross = x1 * y2 - x2 * y1
+        a += cross
+        cx += (x1 + x2) * cross
+        cy += (y1 + y2) * cross
+    if abs(a) < 1e-12:
+        return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
+    return (cx / (3.0 * a), cy / (3.0 * a))
+
+
+def point_in_polygon(pts, x, y):
+    inside = False
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        if (y1 > y) != (y2 > y):
+            xi = x1 + (y - y1) * (x2 - x1) / (y2 - y1)
+            if x < xi:
+                inside = not inside
+    return inside
+
+
+def point_on_blank(blank, u, v, tol=1e-6):
+    """Is (u, v) (bbox coordinates) inside the blank outline?"""
+    bt = blank["type"]
+    if bt == "rect":
+        return -tol <= u <= blank["x"] + tol and -tol <= v <= blank["y"] + tol
+    if bt == "disc":
+        R, arc = blank["diameter"] / 2.0, blank["arc"]
+        cx, cy = blank["center"]
+        d = math.hypot(u - cx, v - cy)
+        if d > R + tol:
+            return False
+        if blank.get("inner_diameter") and d < blank["inner_diameter"] / 2.0 - tol:
+            return False
+        if arc < 360.0 - 1e-9:
+            ang = math.degrees(math.atan2(v - cy, u - cx)) % 360.0
+            if d > tol and ang > arc + 1e-6:
+                return False
+        return True
+    return point_in_polygon(blank_outline(blank), u, v)
+
+
 # ---------------------------------------------------------------- bend math
 
 def bend_setback(angle_interior, radius, t):
@@ -746,7 +980,7 @@ def bend_setback(angle_interior, radius, t):
 
 class Face(object):
     __slots__ = ("name", "kind", "parent", "origin", "u", "v", "n", "U", "V", "shrink", "bend",
-                 "poly", "edge_of_parent", "u_start", "children", "span")
+                 "poly", "edge_of_parent", "u_start", "children", "span", "center", "polar_center", "closed_u")
 
     def __init__(self, **kw):
         for k in self.__slots__:
@@ -766,7 +1000,8 @@ class Face(object):
         return {"name": self.name, "kind": self.kind, "parent": self.parent,
                 "origin": v_round(self.origin), "u": v_round(self.u), "v": v_round(self.v), "n": v_round(self.n),
                 "U": round(self.U, 4), "V": round(self.V, 4), "shrink": dict(self.shrink),
-                "bend": self.bend, "edge_of_parent": self.edge_of_parent}
+                "bend": self.bend, "edge_of_parent": self.edge_of_parent,
+                "center": [round(c, 4) for c in self.center] if self.center else None}
 
 
 class Plan(object):
@@ -774,6 +1009,9 @@ class Plan(object):
         self.faces = {}        # name -> Face
         self.order = []        # face names in build order (base first)
         self.bend_groups = []  # list of dicts: parent, faces[], rho, invert, radius, sm_length
+        self.folds = []        # wall names made by a fold line across the blank (SheetMetal fold), in order
+        self.rims = []         # wall names made by a rim all around a disc (revolved profile)
+        self.manual_walls = [] # wall names built as arc + flat (straight edge of a disc, polygon edge next to an unbent edge)
         self.instances = []    # feature instances: dict(face, feature, u, v, hu, hv)
         self.label = "Sheet"
         self.warnings = []
@@ -788,8 +1026,11 @@ def plan_sheet(ir):
     # ---- base face
     if blank["type"] in ("rect", "stadium"):
         X, Y = blank["x"], blank["y"]
+        center = polar_center = (X / 2.0, Y / 2.0)
     elif blank["type"] == "disc":
-        X = Y = blank["diameter"]
+        X, Y = blank["bbox"]
+        polar_center = tuple(blank["center"])                 # bolt circles around the arc centre
+        center = polar_center if blank["arc"] >= 360.0 else (X / 2.0, Y / 2.0)
     else:
         xs = [p[0] for p in blank["points"]]
         ys = [p[1] for p in blank["points"]]
@@ -797,9 +1038,11 @@ def plan_sheet(ir):
         # shift polygon so its bbox starts at (0,0)
         dx, dy = -min(xs), -min(ys)
         blank["points"] = [(p[0] + dx, p[1] + dy) for p in blank["points"]]
+        center = polar_center = polygon_centroid(blank["points"])   # "centre" of a triangle = centroid
     base = Face(name="base", kind="base", parent=None, origin=(0.0, 0.0, 0.0),
                 u=(1.0, 0.0, 0.0), v=(0.0, 1.0, 0.0), n=(0.0, 0.0, 1.0), U=X, V=Y,
-                poly=list(blank["points"]) if blank["type"] == "polygon" else None)
+                poly=list(blank["points"]) if blank["type"] == "polygon" else None,
+                center=center, polar_center=polar_center)
     plan.faces["base"] = base
     plan.order.append("base")
 
@@ -807,26 +1050,23 @@ def plan_sheet(ir):
     by_parent = {}
     for b in ir["bends"]:
         by_parent.setdefault(b["on"], []).append(b)
-    for b in ir["bends"]:
-        if b["on"] != "base" and b["on"] not in plan.faces:
-            # parents are always defined earlier because normalize enforced the order
-            pass
 
     # setbacks for every bend
     for b in ir["bends"]:
         rho, lam, s_c = bend_setback(b["angle"], b["radius"], t)
         b["rho"], b["lam"], b["s_corner"] = rho, lam, s_c
 
-    # shrink of base per edge
+    # shrink of base per edge (folds and rims do not shrink the blank: they are made from the whole blank)
     for b in by_parent.get("base", []):
+        if b["edge"] in ("fold", "rim", "inner_rim"):
+            continue
         if blank["type"] in ("rect", "stadium"):
             side = {"x-": "u-", "x+": "u+", "y-": "v-", "y+": "v+"}[b["edge"]]
             base.shrink[side] = b["s_corner"]
         elif blank["type"] == "polygon":
             base.shrink[b["edge"]] = b["s_corner"]
-        elif blank["type"] == "disc":
-            raise IRError("bends on a circular blank are not supported yet - describe the part as a rectangular blank, "
-                          "or ask for the flat disc without bends")
+        elif blank["type"] == "disc":            # straight edge of a half / quarter disc
+            base.shrink[{"x-": "u-", "y-": "v-"}[b["edge"]]] = b["s_corner"]
     if blank["type"] in ("rect", "stadium"):
         if base.shrink["u-"] + base.shrink["u+"] >= X or base.shrink["v-"] + base.shrink["v+"] >= Y:
             raise IRError("the bends consume the whole base plate - base dimensions are too small for the bend radius/thickness")
@@ -837,8 +1077,82 @@ def plan_sheet(ir):
         d = 1.0 if b["direction"] in ("up", "in") else -1.0
         rho = b["rho"]
         rr = math.radians(min(rho, 180.0))
+        kind = "wall"
+        extra = {}
+        closed_u = False
         if parent.kind == "base":
-            if blank["type"] in ("rect", "stadium"):
+            if b["edge"] == "fold":
+                # straight bend line across the blank at x_c (outside of the flange) from the centre
+                axis, sign = b["axis"], b["sign"]
+                ext = X if axis == "x" else Y
+                c = base.center[0] if axis == "x" else base.center[1]
+                Rm = b["radius"] + t / 2.0
+                BA = math.radians(rho) * Rm                       # neutral-axis bend allowance (K = 0.5)
+                if b.get("offset") is not None:
+                    x_c = c + sign * abs(b["offset"])
+                    x0 = x_c - sign * b["s_corner"]
+                    x1 = x0 + sign * BA
+                    V_flat = (ext - x1) if sign > 0 else x1
+                    V_out = V_flat - b["lam"]
+                    if b.get("length") is None:
+                        b["length"] = V_out
+                    elif abs(b["length"] - V_out) > 0.5:
+                        plan.warnings.append("%s: the bend line %g mm from the centre gives a flange of %g mm, not %g mm; the bend line position was kept"
+                                             % (b["name"], abs(b["offset"]), V_out, b["length"]))
+                else:
+                    V_out = b["length"]
+                    V_flat = V_out + b["lam"]
+                    x1 = (ext - V_flat) if sign > 0 else V_flat
+                    x0 = x1 - sign * BA
+                    x_c = x0 + sign * b["s_corner"]
+                    b["offset"] = sign * (x_c - c)
+                if V_flat <= 0.5:
+                    raise IRError("bend %r: the bend line is too close to the edge of the plate for a flange" % b["name"])
+                flat_left = x0 if sign > 0 else ext - x0
+                if flat_left <= 0.5:
+                    raise IRError("bend %r: the bend line leaves no flat base on the other side" % b["name"])
+                b["length"] = V_out
+                if axis == "x":
+                    o_hat, e_hat = (float(sign), 0.0, 0.0), (0.0, 1.0, 0.0)
+                else:
+                    o_hat, e_hat = (0.0, float(sign), 0.0), (1.0, 0.0, 0.0)
+                u_start, U_w = flap_span(blank, axis, x1, sign)
+                corner_uv = (x_c, u_start) if axis == "x" else (u_start, x_c)
+                edge_of_parent = "fold:%s%s" % (axis, "+" if sign > 0 else "-")
+                extra = {"fold": True, "axis": axis, "sign": sign, "x0": x0, "x1": x1, "x_c": x_c, "flat": V_flat, "ba": BA,
+                         "offset": abs(x_c - c)}
+                plan.folds.append(b["name"])
+            elif b["edge"] in ("rim", "inner_rim"):
+                R = blank["diameter"] / 2.0
+                cx, cy = blank["center"]
+                Rm = b["radius"] + t / 2.0
+                BA = math.radians(rho) * Rm
+                if b["edge"] == "rim":
+                    outward = 1.0
+                    R_edge = R
+                    x0 = R - b["s_corner"]                            # radial end of the flat bottom
+                    if x0 <= b["radius"] + t + 0.5 or (blank.get("inner_diameter") and x0 <= blank["inner_diameter"] / 2.0 + 0.5):
+                        raise IRError("bend %r: the rim consumes the whole disc" % b["name"])
+                else:
+                    outward = -1.0
+                    R_edge = blank["inner_diameter"] / 2.0
+                    x0 = R_edge + b["s_corner"]
+                    if x0 >= R - 0.5:
+                        raise IRError("bend %r: the neck consumes the whole ring" % b["name"])
+                V_out = b["length"]
+                V_flat = V_out + b["lam"]
+                if V_flat <= 0.5:
+                    raise IRError("flange %r is too short (%g mm) for its bend radius/thickness" % (b["name"], V_out))
+                o_hat, e_hat = (outward, 0.0, 0.0), (0.0, 1.0, 0.0)
+                corner_uv = (cx + R_edge, cy)
+                u_start, U_w = 0.0, 2.0 * math.pi * R_edge          # u = distance along the circumference from +x
+                edge_of_parent = b["edge"]
+                kind = "rim"
+                closed_u = True
+                extra = {"rim": "outer" if outward > 0 else "inner", "R_edge": R_edge, "x0": x0, "flat": V_flat, "ba": BA,
+                         "center": (cx, cy)}
+                plan.rims.append(b["name"])
+            elif blank["type"] in ("rect", "stadium"):
                 if b["edge"] == "x-":
                     o_hat, e_hat = v_mul(base.u, -1.0), base.v
                     corner_uv = (0.0, parent.shrink["v-"])           # start of the wall along the edge
@@ -857,23 +1171,50 @@ def plan_sheet(ir):
                     U_w = X - parent.shrink["u-"] - parent.shrink["u+"]
                 edge_of_parent = b["edge"]
                 u_start = 0.0
+            elif blank["type"] == "disc":          # straight edge of a half / quarter disc: wall added by hand
+                p1, p2 = disc_edge_span(blank, b["edge"], parent.shrink)
+                if b["edge"] == "y-":
+                    o_hat, e_hat = v_mul(base.v, -1.0), base.u
+                    corner_uv = (p1[0], 0.0)
+                    U_w = p2[0] - p1[0]
+                else:
+                    o_hat, e_hat = v_mul(base.u, -1.0), base.v
+                    corner_uv = (0.0, p1[1])
+                    U_w = p2[1] - p1[1]
+                if U_w <= 0.5:
+                    raise IRError("bend %r: the straight edge is too short for a flange" % b["name"])
+                edge_of_parent = b["edge"]
+                u_start = 0.0
+                extra = {"manual": True}
+                plan.manual_walls.append(b["name"])
             else:  # polygon edge e<i>
                 pts = base.poly
+                n_pts = len(pts)
                 i = int(b["edge"][1:])
-                p1, p2 = pts[i], pts[(i + 1) % len(pts)]
+                p1, p2 = pts[i], pts[(i + 1) % n_pts]
                 e2 = (p2[0] - p1[0], p2[1] - p1[1])
                 L_e = math.hypot(*e2)
                 e_hat = (e2[0] / L_e, e2[1] / L_e, 0.0)
                 o_hat = (e_hat[1], -e_hat[0], 0.0)     # outward normal of a CCW polygon
-                # the shrunk polygon edge: neighbours' shrinks trim the ends
+                # the shrunk polygon edge: a BENT neighbour trims the wall end (the two walls miter);
+                # next to an unbent slanted edge the wall keeps the full edge length (the base plate is
+                # set back, the flange is not), like an edge flange in any sheet-metal CAD
+                bent_edges = {x["edge"] for x in by_parent.get("base", [])}
+                prev_bent = ("e%d" % ((i - 1) % n_pts)) in bent_edges
+                next_bent = ("e%d" % ((i + 1) % n_pts)) in bent_edges
                 sp = shrink_polygon(pts, {k: v for k, v in base.shrink.items() if k.startswith("e")})
-                q1, q2 = sp[i], sp[(i + 1) % len(sp)]
-                # wall starts where the shrunk edge starts, projected back to the outside line
-                s_along = (q1[0] - p1[0]) * e_hat[0] + (q1[1] - p1[1]) * e_hat[1]
-                corner_uv = (p1[0] + e_hat[0] * s_along, p1[1] + e_hat[1] * s_along)
-                U_w = math.hypot(q2[0] - q1[0], q2[1] - q1[1])
+                q1, q2 = sp[i], sp[(i + 1) % n_pts]
+                s1 = ((q1[0] - p1[0]) * e_hat[0] + (q1[1] - p1[1]) * e_hat[1]) if prev_bent else 0.0
+                s2 = ((q2[0] - p1[0]) * e_hat[0] + (q2[1] - p1[1]) * e_hat[1]) if next_bent else L_e
+                corner_uv = (p1[0] + e_hat[0] * s1, p1[1] + e_hat[1] * s1)
+                U_w = s2 - s1
+                if U_w <= 0.5:
+                    raise IRError("bend %r: the edge is too short for a flange" % b["name"])
                 edge_of_parent = b["edge"]
                 u_start = 0.0
+                if not (prev_bent and next_bent):
+                    extra = {"manual": True}
+                    plan.manual_walls.append(b["name"])
             outer_offset = 0.0 if d > 0 else t          # outer surface of the base for this bend
             origin = base.point(corner_uv[0], corner_uv[1], outer_offset)
             n_parent = v_mul(base.n, d)
@@ -890,10 +1231,13 @@ def plan_sheet(ir):
         # wall direction / inward normal; for a hem (rho=180) this folds back over the parent
         v_hat = v_unit(v_add(v_mul(o_hat, math.cos(rr)), v_mul(n_parent, math.sin(rr))))
         n_hat = v_unit(v_add(v_mul(o_hat, -math.sin(rr)), v_mul(n_parent, math.cos(rr))))
-        wall = Face(name=b["name"], kind="wall", parent=parent.name, origin=origin, u=e_hat, v=v_hat, n=n_hat,
-                    U=U_w, V=b["length"], edge_of_parent=edge_of_parent, u_start=u_start,
-                    bend={"angle": b["angle"], "rho": rho, "radius": b["radius"], "direction": b["direction"],
-                          "lam": b["lam"], "s_corner": b["s_corner"], "invert": d < 0})
+        bend_info = {"angle": b["angle"], "rho": rho, "radius": b["radius"], "direction": b["direction"],
+                     "lam": b["lam"], "s_corner": b["s_corner"], "invert": d < 0}
+        bend_info.update(extra)
+        wall = Face(name=b["name"], kind=kind, parent=parent.name, origin=origin, u=e_hat, v=v_hat, n=n_hat,
+                    U=U_w, V=b["length"], edge_of_parent=edge_of_parent, u_start=u_start, bend=bend_info,
+                    closed_u=closed_u)
+        wall.center = (U_w / 2.0, b["length"] / 2.0)
         wall.shrink["v-"] = b["s_corner"]     # nominal: bend zone at the root
         parent.children.append(b["name"])
         plan.faces[b["name"]] = wall
@@ -903,13 +1247,16 @@ def plan_sheet(ir):
     for name in plan.order[1:]:
         w = plan.faces[name]
         w.bend["sm_length"] = w.V + w.bend["lam"] - w.shrink["v+"]
-        if w.bend["sm_length"] <= 0.5:
+        if w.bend["sm_length"] <= 0.5 and not (w.bend.get("fold") or w.bend.get("rim")):
             raise IRError("flange %r is too short (%g mm) for its bend radius/thickness" % (name, w.V))
 
-    # bend groups: one SMBendWall call per (parent, rho, invert, radius, sm_length)
+    # bend groups: one SMBendWall call per (parent, rho, invert, radius, sm_length); folds, rims and
+    # hand-built walls are made otherwise
     groups = {}
     for name in plan.order[1:]:
         w = plan.faces[name]
+        if w.bend.get("fold") or w.bend.get("rim") or w.bend.get("manual"):
+            continue
         key = (w.parent, round(w.bend["rho"], 3), w.bend["invert"], round(w.bend["radius"], 3), round(w.bend["sm_length"], 3))
         groups.setdefault(key, []).append(name)
     # keep parent order: base groups first, then by the order of the first wall
@@ -941,7 +1288,8 @@ def plan_sheet(ir):
             continue
         face = plan.faces[f["face"]]
         hu, hv = feature_half_extents(f)
-        for (u, v) in expand_positions(f, face.U, face.V, hu, hv):
+        for (u, v) in expand_positions(f, face.U, face.V, hu, hv, center=face.center, polar_center=face.polar_center,
+                                       closed_u=bool(face.closed_u)):
             plan.instances.append({"face": face.name, "feature": f, "u": u, "v": v, "hu": hu, "hv": hv})
 
     plan.label = derive_label(ir, plan)
@@ -998,10 +1346,10 @@ def feature_half_extents(f):
     return 0.0, 0.0
 
 
-def _anchor(spec, extent, half):
+def _anchor(spec, extent, half, centre=None):
     ref, dist, of = spec["from"], spec["dist"], spec["of"]
     if ref == "center":
-        return extent / 2.0 + dist, 0
+        return (extent / 2.0 if centre is None else centre) + dist, 0
     if ref.endswith("-"):
         return (dist + (half if of == "edge" else 0.0)), +1
     return (extent - dist - (half if of == "edge" else 0.0)), -1
@@ -1021,28 +1369,42 @@ def fit_pattern_axis(f, U, V):
         f["_axis_flipped"] = True
 
 
-def expand_positions(f, U, V, hu, hv):
-    """All feature centres (u, v) on the face after pattern + mirror expansion."""
+def expand_positions(f, U, V, hu, hv, center=None, polar_center=None, closed_u=False):
+    """All feature centres (u, v) on the face after pattern + mirror expansion.
+
+    center       : what "from: center" means on this face (bbox centre by default; centroid on a triangle)
+    polar_center : centre of polar patterns (the arc centre of a disc sector)
+    closed_u     : u runs around a closed loop (rim of a disc): an "even" row is n equal gaps around
+    """
     fit_pattern_axis(f, U, V)
+    cu, cv = center if center else (U / 2.0, V / 2.0)
     if f.get("positions"):
         pts = list(f["positions"])
     else:
         at = f["at"]
-        uc, su = _anchor(at["u"], U, hu)
-        vc, sv = _anchor(at["v"], V, hv)
         pat = f.get("pattern")
+        if pat and pat["type"] == "polar" and polar_center:
+            cu, cv = polar_center
+        uc, su = _anchor(at["u"], U, hu, cu)
+        vc, sv = _anchor(at["v"], V, hv, cv)
         pts = [(uc, vc)]
         if pat:
             if pat["type"] == "linear":
                 n, p = pat["count"], pat["pitch"]
-                if pat.get("even") or p is None:
+                if closed_u and pat["axis"] == "u" and (pat.get("even") or p is None):
+                    p = U / float(n)
+                    u_first = (uc - cu) if at["u"]["from"] == "center" else uc
+                    pts = [((u_first + i * p) % U, vc) for i in range(n)]
+                    n = 0
+                elif pat.get("even") or p is None:
                     extent = U if pat["axis"] == "u" else V
                     p = extent / (n + 1.0)
                     if pat["axis"] == "u":
                         uc, su = extent / 2.0, 0
                     else:
                         vc, sv = extent / 2.0, 0
-                pts = []
+                if n:
+                    pts = []
                 for i in range(n):
                     if pat["axis"] == "u":
                         off = (i - (n - 1) / 2.0) * p if su == 0 else su * i * p
@@ -1087,11 +1449,28 @@ def derive_label(ir, plan):
     blank = ir["blank"]
     base_bends = [plan.faces[n] for n in plan.order[1:] if plan.faces[n].parent == "base"]
     nb = len(base_bends)
+    if blank["type"] == "disc":
+        rims = [w for w in base_bends if w.bend.get("rim")]
+        if rims:
+            return "Cover-Circular" if any(w.bend["rim"] == "outer" for w in rims) else "Collar-Circular"
+        if nb == 0:
+            return "Sheet-Circular" if blank["arc"] >= 360.0 else "Sheet-Circular-Sector"
+        folds = [w for w in base_bends if w.bend.get("fold")]
+        if len(folds) == nb:
+            dirs = set(w.bend["direction"] for w in folds)
+            if nb == 1:
+                return "L-bracket-Circular"
+            if nb == 2:
+                return "U-shaped-Circular" if len(dirs) == 1 else "Z-shaped-Circular"
+        return "Sheet-Circular-Bent"
     if nb == 0:
-        return {"rect": "Sheet", "stadium": "Sheet", "disc": "Sheet-Circular", "polygon": "Triangle" if len(blank.get("points") or []) == 3 else "Sheet"}[blank["type"]]
+        if blank["type"] == "polygon":
+            n_pts = len(blank.get("points") or [])
+            return "Triangle" if n_pts == 3 else ("Sheet-Hexagonal" if blank.get("regular") == 6 else "Sheet-Polygon")
+        return "Sheet"
     if blank["type"] == "polygon":
         return "Triangle" if len(blank["points"]) == 3 else "Sheet-Bent"
-    edges = [w.edge_of_parent for w in base_bends]
+    edges = [w.edge_of_parent[5:] if w.edge_of_parent.startswith("fold:") else w.edge_of_parent for w in base_bends]
     dirs = set(w.bend["direction"] for w in base_bends)
     if nb == 1:
         return "L-bracket"
