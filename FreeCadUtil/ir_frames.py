@@ -362,6 +362,11 @@ def normalize_ir(ir):
                 elif ax in ("x", "u", "length", "x-", "x+"):
                     axis = "x"
                 off = b.get("offset")
+                if off is not None and b.get("length") is not None and abs(float(off)) < 1e-9:
+                    # "offset 0" next to a stated flange height is a placeholder ("bent at the edge"), not a fold
+                    # through the centre: the flange height decides where the bend line is
+                    off = None
+                    b["_offset_dropped"] = True
                 if off is not None:
                     # the sign of the offset names the half that folds (negative = the x-/y- half); it wins over
                     # any side word so that a normalised IR re-normalises to the same part
