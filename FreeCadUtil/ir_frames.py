@@ -641,6 +641,8 @@ def normalize_ir(ir):
                     raise first_err
             f["at"] = nat
         pat = f.get("pattern")
+        if pat and str(pat.get("type") or "").strip().lower() in ("none", "no", "null", "single", "") and not pat.get("count") and not pat.get("circle_diameter"):
+            pat = None                     # the patch prompt likes to write {"pattern": {"type": "none"}} for a single feature
         if pat:
             pat = dict(pat)
             ptype = str(pat.get("type") or ("polar" if pat.get("circle_diameter") else ("grid" if isinstance(pat.get("count"), (list, tuple)) else "linear"))).lower()
