@@ -44,10 +44,8 @@ if _ROOT not in sys.path:
 from FreeCadUtil import ir_frames as F                                   # noqa: E402
 from FreeCadUtil.PlateFunction import (_ensure_sheetmetal, makeOblong, makeKeyhole,   # noqa: E402
                                        makeHexagon, makeCountersink, makeDiagonalCornerCut)
-from FreeCadUtil.CoffreFunction import find_edge_by_coordinates          # noqa: E402
 from FreeCadUtil.TubeFunction import (makeRectangularTube, makeCircularTube,          # noqa: E402
-                                      create_square_tube_angled_cuts,
-                                      create_circular_tube_angled_cuts, create_rectangular_tab)
+                                      create_square_tube_angled_cuts)
 from FreeCadUtil.GeometryAnalyzer import export_geometry_to_json          # noqa: E402
 
 MARGIN = 1.0          # mm of tool overshoot outside the material
@@ -671,7 +669,6 @@ def _round_tube_tool(ir, inst):
     tube = ir["tube"]
     f = inst["feature"]
     R = tube["diameter"] / 2.0
-    wall = tube["wall"] or R
     a = math.radians(inst["v"])         # angle from +Z toward +X
     u = inst["u"]
     n_hat = App.Vector(-math.sin(a), 0.0, -math.cos(a))      # radially inward

@@ -17,7 +17,6 @@ sheetmetal_path = os.path.join(os.path.dirname(__file__), '..', 'sheetmetal')
 if sheetmetal_path not in sys.path:
     sys.path.insert(0, sheetmetal_path)
 
-from sheetmetal import SheetMetalCmd, SheetMetalBaseShapeCmd
 import SheetMetalTools
 
 def taskRestoreDefaults(obj, default_vars):
@@ -112,7 +111,6 @@ def makeRectangularTube(length, outer_width, outer_height, thickness,
     tube_shape = outer_box_filleted.cut(inner_box_filleted)
 
     return tube_shape
-Part.makeRectangularTube = makeRectangularTube
 
 
 def makeCircularTube(length, outer_diameter, thickness):
@@ -164,7 +162,6 @@ def makeCircularTube(length, outer_diameter, thickness):
 
     return tube_shape
 
-Part.makeCircularTube = makeCircularTube
 
 
 def create_square_tube_angled_cuts(tube_shape, length, outer_width, outer_height, left_cut_angle=45.0, right_cut_angle=60.0):
@@ -261,138 +258,3 @@ def create_square_tube_angled_cuts(tube_shape, length, outer_width, outer_height
 
     return tube_shape
 
-def create_circular_tube_angled_cuts(tube_shape, length, outer_diameter, cut_angle_1_deg=60.0, cut_angle_2_deg=80.0):
-    """
-    Apply angled cuts to both ends of a circular tube oriented along the Y-axis.
-    Uses rotated cutting boxes for correct angle geometry on circular surfaces.
-
-    Convention:
-        - Cut 1 = START end at Y=0
-        - Cut 2 = END   end at Y=length
-        - Angle measured from the tube axis (Y) in the Y-Z plane
-        - 0.0  = straight/90° cut (no cut applied) — skipped
-        - 45.0 = 45° bevel
-        - 90.0 = invalid, skipped
-
-    The cutting box is built along the Y-axis, then rotated around the X-axis
-    to produce the correct bevel plane on a circular cross-section.
-
-    Args:
-        tube_shape (Part.Shape): The tube shape to cut
-        length (float): Length of the tube along Y-axis
-        outer_diameter (float): Outer diameter of the tube
-        cut_angle_1_deg (float): Bevel angle at Y=0 (start) in degrees (default: 60.0)
-        cut_angle_2_deg (float): Bevel angle at Y=length (end) in degrees (default: 80.0)
-
-    Returns:
-        Part.Shape: The tube shape with angled cuts applied
-    """
-    # Convert angles to radians
-    cut_angle_1_rad = math.radians(cut_angle_1_deg)
-    cut_angle_2_rad = math.radians(cut_angle_2_deg)
-
-    tube_radius = outer_diameter / 2
-
-    # Skip 0-degree and 90-degree cuts
-    if abs(cut_angle_1_deg) < 0.001 or abs(cut_angle_1_deg - 90.0) < 0.001:
-        print(f"Skipping first cut: angle {cut_angle_1_deg}° is a straight cut or invalid.")
-        cut_1_enabled = False
-    else:
-        bevel_length_1 = tube_radius / math.tan(cut_angle_1_rad)
-        cut_1_enabled = True
-
-    if abs(cut_angle_2_deg) < 0.001 or abs(cut_angle_2_deg - 90.0) < 0.001:
-        print(f"Skipping second cut: angle {cut_angle_2_deg}° is a straight cut or invalid.")
-        cut_2_enabled = False
-    else:
-        bevel_length_2 = tube_radius / math.tan(cut_angle_2_rad)
-        cut_2_enabled = True
-
-    # Create a sufficiently large cutting box to cover the entire tube diameter
-    box_size = outer_diameter * 3
-
-    # First bevel cut at the start (Y=0)
-    # Strategy: build a box along Y, position it, then rotate around X-axis
-    if cut_1_enabled:
-        cutter1 = Part.makeBox(box_size, abs(bevel_length_1) * 2, box_size)
-        # Center the box on the tube axis, front face at Y=0
-        cutter1.translate(App.Vector(-box_size / 2, -abs(bevel_length_1), -box_size / 2))
-        # Rotate around X-axis to tilt the cutting plane at the correct bevel angle
-        # Positive rotation tilts the box so its face cuts at the bevel angle from Y-axis
-        cutter1.rotate(App.Vector(0, 0, 0), App.Vector(1, 0, 0), -(90 - cut_angle_1_deg))
-
-    # Second bevel cut at the end (Y=length)
-    if cut_2_enabled:
-        cutter2 = Part.makeBox(box_size, abs(bevel_length_2) * 2, box_size)
-        # Position so that box is centered at Y=length
-        cutter2.translate(App.Vector(-box_size / 2, length - abs(bevel_length_2), -box_size / 2))
-        # Rotate in the opposite direction for the other end
-        cutter2.rotate(App.Vector(0, length, 0), App.Vector(1, 0, 0), (90 - cut_angle_2_deg))
-
-    # Apply the cuts to the tube shape
-    try:
-        if cut_1_enabled:
-            tube_shape = tube_shape.cut(cutter1)
-        if cut_2_enabled:
-            tube_shape = tube_shape.cut(cutter2)
-    except Exception as e:
-        print(f"Warning: Could not apply circular angled cuts: {e}")
-
-    return tube_shape
-
-def create_rectangular_tab(tube_shape, tab_length, tab_width, tube_length, tube_width, tube_height, tube_thickness,
-                          add_start_tab=True, add_end_tab=True):
-    """
-    Create rectangular tabs (tenons) on top and bottom walls at both ends of the tube.
-
-    The tube is oriented along the Y-axis (Y=0 = start, Y=tube_length = end).
-    Tabs extend beyond the tube ends in the Y direction and are centered in X.
-
-    Tab geometry:
-        - tab_length : extent of tab in X direction (centered on tube width)
-        - tab_width  : how far the tab protrudes beyond the tube end (in Y direction)
-        - tab sits on the top wall    (Z = tube_height - tube_thickness) and
-          bottom wall (Z = 0)
-        - tab thickness = tube_thickness
-
-    Args:
-        tube_shape (Part.Shape): The existing tube shape
-        tab_length (float): Length of the tab in X direction (≤ tube_width)
-        tab_width (float): Protrusion length of the tab beyond the tube end (Y direction)
-        tube_length (float): Length of the tube along Y-axis
-        tube_width (float): Width of the tube (X dimension)
-        tube_height (float): Height of the tube (Z dimension)
-        tube_thickness (float): Wall thickness of the tube
-        add_start_tab (bool): Whether to add tabs at Y=0 (default: True)
-        add_end_tab (bool): Whether to add tabs at Y=tube_length (default: True)
-
-    Returns:
-        Part.Shape: Combined shape with tabs fused
-    """
-    # X center offset so tab is centered on tube width
-    tab_x_offset = (tube_width - tab_length) / 2   # left edge of tab in X
-
-    # Z positions of top and bottom walls
-    tab_z_top    = tube_height - tube_thickness     # top wall top face
-    tab_z_bottom = 0                                # bottom wall bottom face
-
-    # Start with the original tube shape
-    combined_shape = tube_shape
-
-    # Tabs at start of tube (Y=0): tab protrudes in -Y direction
-    if add_start_tab:
-        tab_box_start_top    = Part.makeBox(tab_length, tab_width, tube_thickness,
-                                            App.Vector(tab_x_offset, -tab_width, tab_z_top))
-        tab_box_start_bottom = Part.makeBox(tab_length, tab_width, tube_thickness,
-                                            App.Vector(tab_x_offset, -tab_width, tab_z_bottom))
-        combined_shape = combined_shape.fuse(tab_box_start_top).fuse(tab_box_start_bottom)
-
-    # Tabs at end of tube (Y=tube_length): tab protrudes in +Y direction
-    if add_end_tab:
-        tab_box_end_top    = Part.makeBox(tab_length, tab_width, tube_thickness,
-                                          App.Vector(tab_x_offset, tube_length, tab_z_top))
-        tab_box_end_bottom = Part.makeBox(tab_length, tab_width, tube_thickness,
-                                          App.Vector(tab_x_offset, tube_length, tab_z_bottom))
-        combined_shape = combined_shape.fuse(tab_box_end_top).fuse(tab_box_end_bottom)
-
-    return combined_shape

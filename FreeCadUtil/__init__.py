@@ -1,7 +1,2 @@
-# FreeCadUtil package initialization
-# Import all functions from the new modular files to make them available at package level
-from .TubeFunction import *
-from .BendFunction import *
-from .PlateFunction import *
-from .CoffreFunction import *
-from .GeometryAnalyzer import *
+"""FreeCAD-side helpers.  ir_frames is pure Python and is imported by the API too, so this
+package must not import FreeCAD at import time."""
