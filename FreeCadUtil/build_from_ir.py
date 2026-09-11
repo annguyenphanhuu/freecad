@@ -123,6 +123,9 @@ def make_blank(ir, plan):
             edges = [e for c in cs for e in _corner_edges(solid, *xy[c], t=t)]
             if edges:
                 solid = solid.makeChamfer(ch, edges)
+        perf = next((i["feature"] for i in plan.instances if i["feature"]["type"] == "perforation"), None)
+        if perf is not None:
+            solid = _perforated_solid(solid, ir, perf)
         return solid
     if blank["type"] == "stadium":
         return makeOblong(blank["x"], blank["y"], t, App.Vector(0, 0, 0), App.Vector(0, 0, 1))
@@ -149,6 +152,91 @@ def make_blank(ir, plan):
         face = Part.Face(Part.makePolygon(vecs + [vecs[0]]))
         return face.extrude(App.Vector(0, 0, t))
     raise BuildError("unknown blank type %r" % blank["type"])
+
+
+def _hole_wire(f, cx, cy):
+    """Closed 2D outline of one perforation hole at z = 0, counter-clockwise."""
+    z = App.Vector(0, 0, 1)
+    c = App.Vector(cx, cy, 0)
+    w, l = f["hole_w"], f["hole_l"]
+    if f["shape"] == "R":
+        return Part.Wire(Part.makeCircle(w / 2.0, c, z))
+    if f["shape"] == "C":
+        h2 = w / 2.0
+        return Part.makePolygon([c + App.Vector(-h2, -h2, 0), c + App.Vector(h2, -h2, 0), c + App.Vector(h2, h2, 0),
+                                 c + App.Vector(-h2, h2, 0), c + App.Vector(-h2, -h2, 0)])
+    if f["shape"] == "LC":
+        hl, hw = l / 2.0, w / 2.0
+        return Part.makePolygon([c + App.Vector(-hl, -hw, 0), c + App.Vector(hl, -hw, 0), c + App.Vector(hl, hw, 0),
+                                 c + App.Vector(-hl, hw, 0), c + App.Vector(-hl, -hw, 0)])
+    r, dx = w / 2.0, (l - w) / 2.0                       # LR stadium, long axis along x
+    c1, c2 = c + App.Vector(-dx, 0, 0), c + App.Vector(dx, 0, 0)
+    return Part.Wire([Part.LineSegment(c1 + App.Vector(0, -r, 0), c2 + App.Vector(0, -r, 0)).toShape(),
+                      Part.makeCircle(r, c2, z, -90, 90),
+                      Part.LineSegment(c2 + App.Vector(0, r, 0), c1 + App.Vector(0, r, 0)).toShape(),
+                      Part.makeCircle(r, c1, z, 90, 270)])
+
+
+def _perforated_solid(solid, ir, f):
+    """Plate with its perforation: top-face outer wire + one REVERSED wire per hole -> Part.Face -> extrude.
+
+    The 3D boolean cut of thousands of holes is superlinear (minutes for 10k holes);
+    the 2D face route is ~100x faster and gives the same solid.  The volume is checked
+    and a boolean cut is used as a fallback if the face route ever disagrees.
+    """
+    t = ir["thickness"]
+    lay = f["layout"]
+    if not lay["points"]:
+        return solid
+    top = None
+    for face in solid.Faces:
+        if face.Surface.__class__.__name__ == "Plane" and face.normalAt(0, 0).z > 0.95 and abs(face.CenterOfMass.z - t) < 1e-6:
+            if top is None or face.Area > top.Area:
+                top = face
+    expected = solid.Volume - lay["count"] * f["hole_area"] * t
+    try:
+        outer = top.OuterWire.copy()
+        outer.translate(App.Vector(0, 0, -t))
+        inners = []
+        for (cx, cy) in lay["points"]:
+            wire = _hole_wire(f, cx, cy)
+            wire.reverse()
+            inners.append(wire)
+        plate = Part.Face([outer] + inners).extrude(App.Vector(0, 0, t))
+        if plate.isValid() and len(plate.Solids) == 1 and abs(plate.Volume - expected) <= max(1.0, 1e-4 * expected):
+            return plate
+        print("[IR_BUILD] perforation face route gave volume %.1f (expected %.1f), falling back to a boolean cut" % (plate.Volume, expected))
+    except Exception as exc:
+        print("[IR_BUILD] perforation face route failed (%s), falling back to a boolean cut" % exc)
+    tools = []
+    for (cx, cy) in lay["points"]:
+        wire = _hole_wire(f, cx, cy)
+        wire.translate(App.Vector(0, 0, -MARGIN))
+        tools.append(Part.Face(wire).extrude(App.Vector(0, 0, t + 2 * MARGIN)))
+    return solid.cut(Part.makeCompound(tools))
+
+
+def make_profile(ir):
+    """T / I structural profile: flange(s) + web as fused boxes along y, optional inner fillets at the junctions."""
+    p = ir["profile"]
+    W, H, L, t = p["width"], p["height"], p["length"], p["thickness"]
+    xw = (W - t) / 2.0
+    parts = [Part.makeBox(W, L, t), Part.makeBox(t, L, H, App.Vector(xw, 0, t))]
+    if p["section"] == "I":
+        parts.append(Part.makeBox(W, L, t, App.Vector(0, 0, t + H)))
+    shape = parts[0].fuse(parts[1:]).removeSplitter()
+    r = p.get("radius") or 0.0
+    if r > 0:
+        targets = [(xw, t), (xw + t, t)] + ([(xw, t + H), (xw + t, t + H)] if p["section"] == "I" else [])
+        edges = [e for e in shape.Edges if abs(e.Length - L) < 1e-6
+                 and any(abs(e.CenterOfMass.x - x) < 1e-6 and abs(e.CenterOfMass.z - z) < 1e-6 for x, z in targets)]
+        try:
+            res = shape.makeFillet(r, edges)
+            if res.isValid():
+                shape = res
+        except Exception:
+            pass
+    return shape
 
 
 def _revolved_profile_faces(ir, plan, w):
@@ -485,6 +573,17 @@ def _local_tool(inst, t, hole_depth=None):
         if f["orientation"] == "v":
             tool.rotate(App.Vector(u, v, 0), App.Vector(0, 0, 1), 90)
         return tool
+    if ft == "half_moon":
+        # half disc: the straight edge faces the `flat` side, the round part lies on the other side of the centre
+        r = f["diameter"] / 2.0
+        cyl = Part.makeCylinder(r, h, App.Vector(u, v, z0), App.Vector(0, 0, 1))
+        pad = r + MARGIN
+        boxes = {"v-": (App.Vector(u - pad, v - pad, z0), (2 * pad, pad, h)),
+                 "v+": (App.Vector(u - pad, v, z0), (2 * pad, pad, h)),
+                 "u-": (App.Vector(u - pad, v - pad, z0), (pad, 2 * pad, h)),
+                 "u+": (App.Vector(u, v - pad, z0), (pad, 2 * pad, h))}
+        pnt, (a, b, c) = boxes[f["flat"]]
+        return cyl.cut(Part.makeBox(a, b, c, pnt))
     raise BuildError("unknown feature type %r" % ft)
 
 
@@ -496,6 +595,13 @@ def make_tools(ir, plan, sheet=True):
         face = plan.faces[inst["face"]]
         if f["type"] in ("boss", "corner_fillet"):
             continue                                  # handled after the cuts
+        if f["type"] == "perforation":
+            lay = f["layout"]
+            meta["perforation"] = {"notation": f["notation"], "shape": f["shape"], "hole_w": f["hole_w"], "hole_l": f["hole_l"],
+                                   "pitch_type": f["pitch_type"], "pitch_x": f["pitch_x"], "pitch_y": round(f["pitch_y"], 4),
+                                   "count": lay["count"], "pct_theoretical": round(f["pct_theoretical"], 2),
+                                   "pct_actual": round(lay["pct_actual"], 2), "margins": [round(lay["margin_x"], 3), round(lay["margin_y"], 3)]}
+            continue                                  # cut into the blank face (make_blank)
         if f["type"] == "corner_cut":
             blank = ir["blank"]
             cname = {"x-y-": "front_left", "x+y-": "front_right", "x-y+": "back_left", "x+y+": "back_right"}[f["corner"]]
@@ -510,7 +616,7 @@ def make_tools(ir, plan, sheet=True):
             local_t = t
             if face.kind == "edge":
                 local_t = face.span          # drilled into the plate from its edge face
-            if face.kind == "tube" and f.get("through") == "both":
+            if face.kind == "tube" and f.get("through") == "both" and ir.get("tube"):
                 # go through the whole section: extend the tool along n
                 tube = ir["tube"]
                 span = tube["height"] if face.name in ("top", "bottom") else tube["width"]
@@ -781,6 +887,9 @@ def build(ir, doc=None):
     if ir["family"] == "tube":
         shape = make_tube(ir, plan)
         bend_obj = None
+    elif ir["family"] == "profile":
+        shape = make_profile(ir)
+        bend_obj = None
     else:
         blank = make_blank(ir, plan)
         report["blank_volume"] = round(blank.Volume, 3)
@@ -790,7 +899,7 @@ def build(ir, doc=None):
     tools, meta = make_tools(ir, plan)
     shape, failed = cut_all(shape, tools)
     meta["failed"] = failed
-    if ir["family"] != "tube":
+    if ir["family"] == "sheet":
         shape = fuse_bosses(shape, ir, plan, meta)
         shape = fillet_wall_corners(shape, ir, plan, meta)
     if failed:
@@ -806,7 +915,7 @@ def build(ir, doc=None):
         "bbox": _bbox(shape), "volume": round(shape.Volume, 3), "faces_count": len(shape.Faces),
         "solids": len(shape.Solids), "valid": bool(shape.isValid()), "tools": len(tools),
         "bends": [{"name": n, **{k: plan.faces[n].bend[k] for k in ("angle", "radius", "direction")},
-                   "length": plan.faces[n].V, "on": plan.faces[n].parent} for n in plan.order[1:]] if ir["family"] != "tube" else [],
+                   "length": plan.faces[n].V, "on": plan.faces[n].parent} for n in plan.order[1:]] if ir["family"] == "sheet" else [],
         "metadata": meta, "build_seconds": round(time.time() - t0, 2),
     })
     return shape, ir, plan, report
@@ -861,6 +970,8 @@ def export_all(shape, ir, plan, report, sanitized_title, output_dir_abs, materia
 def build_and_export(ir, sanitized_title, output_dir_abs, material=None, write_obj=True):
     doc = App.newDocument("IRBuild")
     shape, nir, plan, report = build(ir, doc)
+    if report["metadata"].get("perforation"):
+        write_obj = False           # meshing thousands of holes takes minutes; the legacy scripts skipped OBJ too
     files = export_all(shape, nir, plan, report, sanitized_title, output_dir_abs, material=material, write_obj=write_obj, doc=doc)
     report["files"] = files
     print("[IR_BUILD] " + json.dumps({k: report[k] for k in ("label", "bbox", "volume", "faces_count", "solids", "valid", "tools", "build_seconds")}))

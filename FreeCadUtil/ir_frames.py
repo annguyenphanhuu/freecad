@@ -104,7 +104,7 @@ SECTOR_EDGE_ALIASES = {"y-": "y-", "diameter": "y-", "flat": "y-", "straight": "
 REGULAR_POLYGONS = {"pentagon": 5, "hexagon": 6, "hexagonal": 6, "heptagon": 7, "octagon": 8, "octagonal": 8,
                     "regular_polygon": 0, "regular": 0}
 
-ROUND_TYPES = ("hole", "hex", "thread", "countersink", "counterbore", "blind_hole", "boss")
+ROUND_TYPES = ("hole", "hex", "thread", "countersink", "counterbore", "blind_hole", "boss", "half_moon")
 BOX_TYPES = ("slot", "rect", "window", "keyhole")
 
 # ISO metric coarse: nominal -> tap drill (from rules TH_06)
@@ -115,6 +115,13 @@ TAP_DRILL = {
     "M14": 12.0, "M16": 14.0, "M18": 15.5, "M20": 17.5, "M22": 19.5, "M24": 21.0,
     "M27": 24.0, "M30": 26.5, "M33": 29.5, "M36": 32.0, "M39": 35.0, "M42": 37.5,
     "M45": 40.5, "M48": 43.0, "M52": 47.0, "M56": 52.0, "M64": 60.0,
+}
+# ISO coarse pitch per nominal (TH_06) - used to tell a non-standard pitch (TH_09)
+ISO_COARSE_PITCH = {
+    "M1": 0.25, "M1.2": 0.25, "M1.4": 0.3, "M1.5": 0.3, "M1.6": 0.35, "M1.7": 0.35, "M1.8": 0.35, "M2": 0.4, "M2.2": 0.45,
+    "M2.5": 0.45, "M3": 0.5, "M3.5": 0.6, "M4": 0.7, "M5": 0.8, "M6": 1.0, "M7": 1.0, "M8": 1.25, "M9": 1.25, "M10": 1.5,
+    "M11": 1.5, "M12": 1.75, "M14": 2.0, "M16": 2.0, "M18": 2.5, "M20": 2.5, "M22": 2.5, "M24": 3.0, "M27": 3.0, "M30": 3.5,
+    "M33": 3.5, "M36": 4.0, "M39": 4.0, "M42": 4.5, "M45": 4.5, "M48": 5.0, "M52": 5.0, "M56": 5.5, "M64": 6.0,
 }
 # fine pitch (TH_07): (nominal, pitch) -> tap drill
 TAP_DRILL_FINE = {
@@ -170,6 +177,8 @@ def _num(x, name, positive=True, allow_none=False):
         v = float(x)
     except (TypeError, ValueError):
         raise IRError("%s must be a number, got %r" % (name, x))
+    if positive and allow_none and abs(v) < 1e-12:
+        return None                       # optional radius / diameter given as 0 = "none" (also keeps re-normalising idempotent)
     if positive and v <= 0:
         raise IRError("%s must be > 0, got %g" % (name, v))
     return v
@@ -240,6 +249,8 @@ def normalize_ir(ir):
     ir["material"] = str(mat).lower()
     if fam == "tube":
         return _normalize_tube(ir)
+    if fam == "profile":
+        return _normalize_profile(ir)
     if fam != "sheet":
         raise IRError("unsupported family %r" % fam)
 
@@ -461,7 +472,12 @@ def normalize_ir(ir):
                    "fillet": "corner_fillet", "corner_radius": "corner_fillet", "chamfer": "corner_chamfer",
                    "engraving": "engrave", "text": "engrave", "marking": "engrave",
                    "bushing": "boss", "bush": "boss", "standoff": "boss", "stand_off": "boss", "pin": "boss", "stud": "boss",
-                   "spacer": "boss", "welded_bushing": "boss", "cylinder": "boss", "insert": "boss"}
+                   "spacer": "boss", "welded_bushing": "boss", "cylinder": "boss", "insert": "boss",
+                   "halfmoon": "half_moon", "half_moon_cutout": "half_moon", "half_moon_notch": "half_moon", "d_cut": "half_moon",
+                   "d_shape": "half_moon", "d_hole": "half_moon", "semicircle": "half_moon", "semi_circle": "half_moon",
+                   "semicircular": "half_moon", "semi_circular_notch": "half_moon", "demi_lune": "half_moon", "half_circle": "half_moon",
+                   "perforated": "perforation", "perforations": "perforation", "perf": "perforation", "perforated_pattern": "perforation",
+                   "hole_grid": "perforation", "perforation_pattern": "perforation"}
         ftype = aliases.get(ftype, ftype)
         if ftype == "window":
             ftype = "rect"
@@ -509,6 +525,13 @@ def normalize_ir(ir):
         if ftype == "engrave":
             # engraving is not modelled in the solid; keep as a note
             f["note_only"] = True
+            feats.append(f)
+            continue
+        if ftype == "perforation":
+            if face != "base" or blank["type"] != "rect":
+                raise IRError("a perforation pattern is only supported on a rectangular base plate")
+            f.update(normalize_perforation(f))
+            f["at"], f["pattern"], f["mirror"], f["positions"] = None, None, [], None
             feats.append(f)
             continue
         if ftype == "corner_cut":
@@ -573,6 +596,16 @@ def normalize_ir(ir):
             f["inner_diameter"] = _num(f.get("inner_diameter") or f.get("hole_diameter"), "boss inner diameter", allow_none=True)
             if f["inner_diameter"] and f["inner_diameter"] >= f["diameter"]:
                 raise IRError("boss inner diameter must be smaller than its outer diameter")
+        elif ftype == "half_moon":
+            # half disc cut: position = centre of the full circle, `flat` = the side the straight edge faces
+            f["diameter"] = _num(f.get("diameter") or (2.0 * float(f["radius"]) if f.get("radius") else None), "half-moon diameter")
+            flat = str(f.get("flat") or f.get("flat_side") or f.get("straight_side") or "v-").strip().lower().replace(" ", "_")
+            m = {"u-": "u-", "u+": "u+", "v-": "v-", "v+": "v+", "x-": "u-", "x+": "u+", "y-": "v-", "y+": "v+",
+                 "left": "u-", "right": "u+", "front": "v-", "back": "v+", "bottom": "v-", "top": "v+", "rear": "v+",
+                 "start": "u-", "end": "u+", "bend": "v-", "tip": "v+", "outer": "v+", "outside": "v+", "edge": "v-"}
+            if flat not in m:
+                raise IRError("half-moon: unknown flat side %r (use front/back/left/right)" % f.get("flat"))
+            f["flat"] = m[flat]
         else:
             raise IRError("unknown feature type %r" % f.get("type"))
         if f.get("depth") is not None:
@@ -904,6 +937,110 @@ def disc_edge_span(blank, edge, shrink):
     return (su, sv), (su, cy + R)
 
 
+# ---------------------------------------------------------------- perforation (RMIG notation)
+
+PERF_SHAPES = {"r": "R", "round": "R", "circular": "R", "circle": "R", "hole": "R",
+               "c": "C", "square": "C", "carre": "C", "carré": "C",
+               "lr": "LR", "oblong": "LR", "stadium": "LR", "oblong_rounded": "LR", "slot": "LR", "rounded_slot": "LR",
+               "lc": "LC", "rect": "LC", "rectangular": "LC", "rectangle": "LC", "oblong_rect": "LC", "rect_slot": "LC", "rectangular_slot": "LC"}
+PERF_PITCHES = {"t": "T", "staggered": "T", "triangular": "T", "60": "T", "60°": "T", "stagger_60": "T", "quinconce": "T",
+                "u": "U", "square": "U", "inline": "U", "grid": "U", "straight": "U", "aligned": "U", "rectangular": "U", "en_ligne": "U",
+                "z": "Z", "zigzag": "Z", "generic": "Z", "stagger": "Z", "offset": "Z"}
+
+
+def normalize_perforation(f):
+    """Canonical perforation fields: shape R/C/LR/LC with hole dims, pitch_type T/U/Z with pitch_x/pitch_y/stagger, notation."""
+    shape = PERF_SHAPES.get(str(f.get("shape") or f.get("hole_shape") or "").strip().lower().replace(" ", "_").replace("-", "_"))
+    if shape is None:
+        raise IRError("perforation: hole shape must be round (R), square (C) or oblong (LR / LC)")
+    size = f.get("size")
+    if size is None:
+        size = f.get("diameter") if shape == "R" else f.get("side")
+    if isinstance(size, (list, tuple)):
+        if shape in ("LR", "LC"):
+            if len(size) < 2:
+                raise IRError("perforation: an oblong hole needs [width, length]")
+            w, l = _num(size[0], "perforation hole width"), _num(size[1], "perforation hole length")
+            w, l = min(w, l), max(w, l)
+        else:
+            w = l = _num(size[0], "perforation hole size")
+    else:
+        if shape in ("LR", "LC"):
+            raise IRError("perforation: an oblong hole needs size [width, length]")
+        w = l = _num(size, "perforation hole size")
+    ptype = PERF_PITCHES.get(str(f.get("pitch_type") or f.get("pattern_type") or "").strip().lower().replace(" ", "_").replace("-", "_"))
+    pitch = f.get("pitch")
+    if isinstance(pitch, (list, tuple)):
+        py, px = _num(pitch[0], "perforation pitch"), _num(pitch[1] if len(pitch) > 1 else pitch[0], "perforation pitch")
+        if ptype is None:
+            ptype = "U"
+    else:
+        px = py = _num(pitch, "perforation pitch")
+        if ptype is None:
+            ptype = "T"
+    if ptype == "T":
+        py = px * math.sin(math.radians(60.0))
+        stagger = px / 2.0
+    elif ptype == "Z":
+        stagger = px / 2.0
+    else:
+        stagger = 0.0
+    span_x, span_y = (l, w) if shape in ("LR", "LC") else (w, w)
+    if px <= span_x + 1e-9 or py <= span_y + 1e-9:
+        raise IRError("perforation: the pitch (%g x %g mm) is not larger than the hole (%g x %g mm) - the holes would overlap"
+                      % (px, py, span_x, span_y))
+    if shape == "R":
+        area = math.pi * (w / 2.0) ** 2
+        size_txt = "%g" % w
+    elif shape == "C":
+        area = w * w
+        size_txt = "%g" % w
+    elif shape == "LR":
+        area = math.pi * (w / 2.0) ** 2 + (l - w) * w
+        size_txt = "%gx%g" % (w, l)
+    else:
+        area = w * l
+        size_txt = "%gx%g" % (w, l)
+    if ptype == "T":
+        pitch_txt = "T%g" % px
+    elif ptype == "Z":
+        pitch_txt = "Z%gx%g" % (py, px)
+    else:
+        pitch_txt = ("U%g" % px) if abs(px - py) < 1e-9 else "U%gx%g" % (py, px)
+    return {"shape": shape, "hole_w": w, "hole_l": l, "pitch_type": ptype, "pitch_x": px, "pitch_y": py, "stagger": stagger,
+            "hole_area": area, "pct_theoretical": 100.0 * area / (px * py), "notation": "%s%s %s" % (shape, size_txt, pitch_txt),
+            "open_area_pct": _num(f.get("open_area_pct"), "open area", allow_none=True)}
+
+
+def perforation_layout(f, x0, y0, X, Y, t=0.0):
+    """Centred grid of holes over the flat region [x0, x0+X] x [y0, y0+Y]: as many pitches as fit with
+    symmetric margins (the perforated-sheet calculator's rule), minus rows/columns until the margin to the
+    plate edge is at least half a hole + one thickness; staggered rows are clipped at the edge."""
+    span_x, span_y = (f["hole_l"], f["hole_w"]) if f["shape"] in ("LR", "LC") else (f["hole_w"], f["hole_w"])
+    hx, hy = span_x / 2.0, span_y / 2.0
+    px, py, st = f["pitch_x"], f["pitch_y"], f["stagger"]
+    n_cols = int((X - span_x) / px) + 1 if X >= span_x else 0
+    n_rows = int((Y - span_y) / py) + 1 if Y >= span_y else 0
+    margin = lambda ext, n, p, span: (ext - ((n - 1) * p + span)) / 2.0 if n else ext / 2.0
+    min_mx, min_my = hx + t, hy + t
+    while n_cols > 1 and margin(X, n_cols, px, span_x) < min_mx - 1e-9:
+        n_cols -= 1
+    while n_rows > 1 and margin(Y, n_rows, py, span_y) < min_my - 1e-9:
+        n_rows -= 1
+    mx = margin(X, n_cols, px, span_x)
+    my = margin(Y, n_rows, py, span_y)
+    pts = []
+    for row in range(n_rows):
+        cy = my + hy + row * py
+        off = st if row % 2 == 1 else 0.0
+        for col in range(n_cols):
+            cx = mx + hx + col * px + off
+            if cx - hx >= -1e-6 and cx + hx <= X + 1e-6 and cy - hy >= -1e-6 and cy + hy <= Y + 1e-6:
+                pts.append((x0 + cx, y0 + cy))
+    return {"points": pts, "count": len(pts), "margin_x": mx, "margin_y": my, "n_cols": n_cols, "n_rows": n_rows,
+            "half_x": hx, "half_y": hy, "pct_actual": (100.0 * len(pts) * f["hole_area"] / (X * Y)) if X * Y > 0 else 0.0}
+
+
 def polygon_centroid(pts):
     a = cx = cy = 0.0
     n = len(pts)
@@ -1068,8 +1205,9 @@ def plan_sheet(ir):
         elif blank["type"] == "disc":            # straight edge of a half / quarter disc
             base.shrink[{"x-": "u-", "y-": "v-"}[b["edge"]]] = b["s_corner"]
     if blank["type"] in ("rect", "stadium"):
-        if base.shrink["u-"] + base.shrink["u+"] >= X or base.shrink["v-"] + base.shrink["v+"] >= Y:
-            raise IRError("the bends consume the whole base plate - base dimensions are too small for the bend radius/thickness")
+        if base.shrink["u-"] + base.shrink["u+"] > X - 0.5 or base.shrink["v-"] + base.shrink["v+"] > Y - 0.5:
+            raise IRError("the bends consume the whole base plate (%g x %g mm) - each bend needs radius + thickness = %g mm of flat base"
+                          % (X, Y, max(list(base.shrink.values()) + [0.0])))
 
     # walls (breadth-first: parents before children by construction of normalize order)
     for b in ir["bends"]:
@@ -1286,6 +1424,12 @@ def plan_sheet(ir):
         if f["type"] == "corner_cut":
             plan.instances.append({"face": "base", "feature": f, "u": None, "v": None, "hu": None, "hv": None})
             continue
+        if f["type"] == "perforation":
+            # laid out over the flat part of the base plate (between the bend zones)
+            f["layout"] = perforation_layout(f, base.shrink["u-"], base.shrink["v-"],
+                                             X - base.shrink["u-"] - base.shrink["u+"], Y - base.shrink["v-"] - base.shrink["v+"], t)
+            plan.instances.append({"face": "base", "feature": f, "u": None, "v": None, "hu": None, "hv": None})
+            continue
         face = plan.faces[f["face"]]
         hu, hv = feature_half_extents(f)
         for (u, v) in expand_positions(f, face.U, face.V, hu, hv, center=face.center, polar_center=face.polar_center,
@@ -1325,7 +1469,7 @@ def shrink_polygon(pts, shrinks):
 
 def feature_half_extents(f):
     ft = f["type"]
-    if ft in ("hole", "blind_hole", "thread", "boss"):
+    if ft in ("hole", "blind_hole", "thread", "boss", "half_moon"):
         r = f["diameter"] / 2.0
         return r, r
     if ft == "countersink":
@@ -1467,6 +1611,8 @@ def derive_label(ir, plan):
         if blank["type"] == "polygon":
             n_pts = len(blank.get("points") or [])
             return "Triangle" if n_pts == 3 else ("Sheet-Hexagonal" if blank.get("regular") == 6 else "Sheet-Polygon")
+        if any(f.get("type") == "perforation" for f in ir.get("features") or []):
+            return "Perforated Sheet"
         return "Sheet"
     if blank["type"] == "polygon":
         return "Triangle" if len(blank["points"]) == 3 else "Sheet-Bent"
@@ -1549,11 +1695,7 @@ def _normalize_tube(ir):
     for i, f in enumerate(ir.get("features") or []):
         f = dict(f)
         ftype = str(f.get("type") or "hole").lower()
-        f["type"] = {"circle": "hole", "round_hole": "hole", "oblong": "slot", "rectangle": "rect", "cutout": "rect",
-                     "rectangular": "rect", "tapped": "thread", "threaded": "thread", "countersunk": "countersink",
-                     "tapped_hole": "thread", "threaded_hole": "thread", "rect_cutout": "rect", "window": "rect",
-                     "hexagon": "hex", "hexagonal": "hex", "hex_hole": "hex", "engraving": "engrave", "text": "engrave",
-                     "marking": "engrave"}.get(ftype, ftype)
+        f["type"] = _SIMPLE_TYPE_ALIASES.get(ftype, ftype)
         face = str(f.get("face") or "top").lower()
         if f["type"] in ("engrave", "note"):
             f["type"], f["note_only"], f["face"] = "engrave", True, face
@@ -1571,78 +1713,159 @@ def _normalize_tube(ir):
             f["angle"] = float(ang)
             face = "wall"
         f["face"] = face
-        if f["type"] in ("hole", "blind_hole"):
-            f["diameter"] = _num(f.get("diameter"), "hole diameter")
-        elif f["type"] == "thread":
-            drill, key, pitch = tap_drill_diameter(f.get("thread") or f.get("size"), f.get("pitch"))
-            f["thread"], f["pitch"], f["diameter"] = key, pitch, drill
-        elif f["type"] in ("slot", "rect"):
-            size = f.get("size")
-            if not size or len(size) < 2:
-                raise IRError("%s needs size [long, short]" % f["type"])
-            a, b = _num(size[0], "size"), _num(size[1], "size")
-            f["size"] = [max(a, b), min(a, b)]
-            f["orientation"] = "v" if str(f.get("orientation") or "u").lower() in ("v", "across", "width") else "u"
-        elif f["type"] == "countersink":
-            f["diameter"] = _num(f.get("diameter"), "hole diameter")
-            f["cs_diameter"] = _num(f.get("cs_diameter"), "countersink diameter")
-            f["cs_angle"] = float(f.get("cs_angle") or 90.0)
-            f["cs_side"] = "outer"
-        elif f["type"] == "hex":
-            af = f.get("across_flats") or f.get("size")
-            if af is not None:
-                f["circumradius"] = _num(af, "hex across_flats") / math.sqrt(3.0)
-            else:
-                f["circumradius"] = _num(f.get("diameter"), "hex diameter") / 2.0
-            f["diameter"] = 2.0 * f["circumradius"]
-        elif f["type"] == "keyhole":
-            size = f.get("size")
-            if not size or len(size) < 3:
-                raise IRError("keyhole needs size [total_length, large_diameter, small_diameter]")
-            f["size"] = [float(size[0]), float(size[1]), float(size[2])]
-            f["orientation"] = "v" if str(f.get("orientation") or "u").lower() in ("v", "across", "width") else "u"
-        elif f["type"] == "engrave":
+        if f["type"] == "engrave":
             f["note_only"] = True
             feats.append(f)
             continue
-        else:
-            raise IRError("feature type %r not supported on tubes" % f["type"])
-        f["through"] = str(f.get("through") or "one").lower()
-        at = f.get("at") or {}
-        nat = {}
-        for axis in ("u", "v"):
-            spec = at.get(axis)
-            if spec is None:
-                nat[axis] = {"from": "center", "dist": 0.0, "of": "center", "defaulted": True}
-            elif isinstance(spec, (int, float)):
-                nat[axis] = {"from": axis + "-", "dist": float(spec), "of": "center", "defaulted": False}
-            else:
-                ref = str(spec.get("from") or "center").lower()
-                ref = {"start": "u-", "end": "u+", "left": "v-", "right": "v+", "center": "center", "centre": "center",
-                       "u-": "u-", "u+": "u+", "v-": "v-", "v+": "v+", "bottom": "v-", "top": "v+"}.get(ref, "center")
-                of = str(spec.get("of") or "").lower()
-                if of not in ("center", "edge"):
-                    of = "center" if f["type"] in ROUND_TYPES else "edge"
-                nat[axis] = {"from": ref, "dist": float(spec.get("dist", 0.0) or 0.0), "of": of, "defaulted": False}
-        f["at"] = nat
-        pat = f.get("pattern")
-        if pat:
-            pat = dict(pat)
-            pat["type"] = "linear"
-            pat["count"] = int(pat.get("count") or 1)
-            pitch = pat.get("pitch") if pat.get("pitch") is not None else pat.get("spacing")
-            if pat["count"] > 1 and pitch in (None, "even", "auto"):
-                pat["even"], pat["pitch"] = True, None
-            else:
-                pat["pitch"] = float(pitch or 0.0)
-            pat["axis"] = "v" if str(pat.get("axis") or "u").lower() in ("v", "across") else "u"
-            f["pattern"] = pat
-        mir = f.get("mirror") or []
-        f["mirror"] = [m.lower() for m in ([mir] if isinstance(mir, str) else mir) if m.lower() in ("u", "v")]
-        f["positions"] = None
+        _finish_simple_feature(f, "tubes")
         feats.append(f)
     ir["features"] = feats
     return ir
+
+
+_SIMPLE_TYPE_ALIASES = {"circle": "hole", "round_hole": "hole", "oblong": "slot", "rectangle": "rect", "cutout": "rect",
+                        "rectangular": "rect", "tapped": "thread", "threaded": "thread", "countersunk": "countersink",
+                        "tapped_hole": "thread", "threaded_hole": "thread", "rect_cutout": "rect", "window": "rect",
+                        "hexagon": "hex", "hexagonal": "hex", "hex_hole": "hex", "engraving": "engrave", "text": "engrave",
+                        "marking": "engrave"}
+
+
+def _finish_simple_feature(f, where):
+    """Sizes, position and pattern of a feature on a flat face of a tube or profile (no bends involved)."""
+    if f["type"] in ("hole", "blind_hole"):
+        f["diameter"] = _num(f.get("diameter"), "hole diameter")
+        if f.get("depth") is not None:
+            f["depth"] = _num(f["depth"], "depth")
+    elif f["type"] == "thread":
+        drill, key, pitch = tap_drill_diameter(f.get("thread") or f.get("size"), f.get("pitch"))
+        f["thread"], f["pitch"], f["diameter"] = key, pitch, drill
+    elif f["type"] in ("slot", "rect"):
+        size = f.get("size")
+        if not size or len(size) < 2:
+            raise IRError("%s needs size [long, short]" % f["type"])
+        a, b = _num(size[0], "size"), _num(size[1], "size")
+        f["size"] = [max(a, b), min(a, b)]
+        f["orientation"] = "v" if str(f.get("orientation") or "u").lower() in ("v", "across", "width") else "u"
+    elif f["type"] == "countersink":
+        f["diameter"] = _num(f.get("diameter"), "hole diameter")
+        f["cs_diameter"] = _num(f.get("cs_diameter"), "countersink diameter")
+        f["cs_angle"] = float(f.get("cs_angle") or 90.0)
+        f["cs_side"] = "outer"
+    elif f["type"] == "hex":
+        af = f.get("across_flats") or f.get("size")
+        if af is not None:
+            f["circumradius"] = _num(af, "hex across_flats") / math.sqrt(3.0)
+        else:
+            f["circumradius"] = _num(f.get("diameter"), "hex diameter") / 2.0
+        f["diameter"] = 2.0 * f["circumradius"]
+    elif f["type"] == "keyhole":
+        size = f.get("size")
+        if not size or len(size) < 3:
+            raise IRError("keyhole needs size [total_length, large_diameter, small_diameter]")
+        f["size"] = [float(size[0]), float(size[1]), float(size[2])]
+        f["orientation"] = "v" if str(f.get("orientation") or "u").lower() in ("v", "across", "width") else "u"
+    else:
+        raise IRError("feature type %r not supported on %s" % (f["type"], where))
+    f["through"] = str(f.get("through") or "one").lower()
+    at = f.get("at") or {}
+    nat = {}
+    for axis in ("u", "v"):
+        spec = at.get(axis)
+        if spec is None:
+            nat[axis] = {"from": "center", "dist": 0.0, "of": "center", "defaulted": True}
+        elif isinstance(spec, (int, float)):
+            nat[axis] = {"from": axis + "-", "dist": float(spec), "of": "center", "defaulted": False}
+        else:
+            ref = str(spec.get("from") or "center").lower()
+            ref = {"start": "u-", "end": "u+", "left": "v-", "right": "v+", "center": "center", "centre": "center",
+                   "u-": "u-", "u+": "u+", "v-": "v-", "v+": "v+", "bottom": "v-", "top": "v+",
+                   "flange": "v-", "base": "v-", "tip": "v+", "free": "v+", "free_edge": "v+"}.get(ref, "center")
+            of = str(spec.get("of") or "").lower()
+            if of not in ("center", "edge"):
+                of = "center" if f["type"] in ROUND_TYPES else "edge"
+            nat[axis] = {"from": ref, "dist": float(spec.get("dist", 0.0) or 0.0), "of": of, "defaulted": False}
+    f["at"] = nat
+    pat = f.get("pattern")
+    if pat:
+        pat = dict(pat)
+        pat["type"] = "linear"
+        pat["count"] = int(pat.get("count") or 1)
+        pitch = pat.get("pitch") if pat.get("pitch") is not None else pat.get("spacing")
+        if pat["count"] > 1 and pitch in (None, "even", "auto"):
+            pat["even"], pat["pitch"] = True, None
+        else:
+            pat["pitch"] = float(pitch or 0.0)
+        pat["axis"] = "v" if str(pat.get("axis") or "u").lower() in ("v", "across") else "u"
+        f["pattern"] = pat
+    mir = f.get("mirror") or []
+    f["mirror"] = [m.lower() for m in ([mir] if isinstance(mir, str) else mir) if m.lower() in ("u", "v")]
+    f["positions"] = None
+    return f
+
+
+# ---------------------------------------------------------------- structural profile (T / I), extruded boxes
+
+PROFILE_FACES = {"flange": "flange", "bottom_flange": "flange", "lower_flange": "flange", "base": "flange", "horizontal": "flange",
+                 "bottom": "flange", "foot": "flange", "web": "web", "vertical": "web", "upright": "web", "stem": "web", "leg": "web",
+                 "top_flange": "top_flange", "upper_flange": "top_flange", "top": "top_flange", "head": "top_flange"}
+
+
+def _normalize_profile(ir):
+    p = dict(ir.get("profile") or {})
+    sec = str(p.get("section") or p.get("type") or "T").strip().upper().replace("-SHAPED", "").replace("_SHAPED", "").replace(" SHAPED", "")
+    sec = {"T": "T", "TEE": "T", "TE": "T", "I": "I", "H": "I", "I-BEAM": "I", "IBEAM": "I", "IPN": "I", "IPE": "I", "HEA": "I", "HEB": "I"}.get(sec)
+    if sec is None:
+        raise IRError("unknown profile section %r (T or I)" % (p.get("section"),))
+    p["section"] = sec
+    p["width"] = _num(p.get("width") if p.get("width") is not None else p.get("flange_width"), "profile flange width")
+    p["height"] = _num(p.get("height") if p.get("height") is not None else p.get("web_height"), "profile web height")
+    p["length"] = _num(p.get("length"), "profile length")
+    t = _num(p.get("thickness") if p.get("thickness") is not None else ir.get("thickness"), "profile thickness")
+    if t >= p["width"]:
+        raise IRError("profile thickness must be smaller than the flange width")
+    p["thickness"] = t
+    p["radius"] = _num(p.get("radius") if p.get("radius") is not None else p.get("bend_radius"), "profile inner radius", allow_none=True) or 0.0
+    ir["thickness"] = t
+    ir["profile"] = p
+    feats = []
+    for i, f in enumerate(ir.get("features") or []):
+        f = dict(f)
+        ftype = str(f.get("type") or "hole").lower()
+        f["type"] = _SIMPLE_TYPE_ALIASES.get(ftype, ftype)
+        face = PROFILE_FACES.get(str(f.get("face") or "flange").lower().replace(" ", "_"))
+        if face is None or (face == "top_flange" and sec != "I"):
+            raise IRError("profile feature %d: unknown face %r (use flange / web%s)" % (i + 1, f.get("face"), " / top_flange" if sec == "I" else ""))
+        f["face"] = face
+        if f["type"] == "engrave":
+            f["note_only"] = True
+            feats.append(f)
+            continue
+        _finish_simple_feature(f, "profiles")
+        feats.append(f)
+    ir["features"] = feats
+    return ir
+
+
+def plan_profile(ir):
+    ir = normalize_ir(ir)
+    p = ir["profile"]
+    W, H, L, t = p["width"], p["height"], p["length"], p["thickness"]
+    plan = Plan()
+    # x across the flange width, y along the length, z up; bottom flange z in [0, t], web centred on x
+    plan.faces["flange"] = Face(name="flange", kind="tube", origin=(0.0, 0.0, 0.0), u=(0, 1, 0), v=(1, 0, 0), n=(0, 0, 1), U=L, V=W)
+    plan.faces["web"] = Face(name="web", kind="tube", origin=((W - t) / 2.0, 0.0, t), u=(0, 1, 0), v=(0, 0, 1), n=(1, 0, 0), U=L, V=H)
+    if p["section"] == "I":
+        plan.faces["top_flange"] = Face(name="top_flange", kind="tube", origin=(0.0, 0.0, t + H), u=(0, 1, 0), v=(1, 0, 0), n=(0, 0, 1), U=L, V=W)
+    plan.label = "I-Shaped" if p["section"] == "I" else "T-Shaped"
+    plan.order = list(plan.faces.keys())
+    for f in ir["features"]:
+        if f.get("note_only"):
+            continue
+        face = plan.faces[f["face"]]
+        hu, hv = feature_half_extents(f)
+        for (u, v) in expand_positions(f, face.U, face.V, hu, hv):
+            plan.instances.append({"face": face.name, "feature": f, "u": u, "v": v, "hu": hu, "hv": hv})
+    return ir, plan
 
 
 def plan_tube(ir):
@@ -1678,9 +1901,11 @@ def plan_tube(ir):
 
 
 def plan_part(ir):
-    fam = (ir or {}).get("family") or "sheet"
-    if str(fam).lower() == "tube":
+    fam = str((ir or {}).get("family") or "sheet").lower()
+    if fam == "tube":
         return plan_tube(ir)
+    if fam == "profile":
+        return plan_profile(ir)
     return plan_sheet(ir)
 
 
