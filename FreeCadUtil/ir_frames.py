@@ -95,8 +95,9 @@ TRIANGLE_EDGE_ALIASES = {"e0": "e0", "base": "e0", "ab": "e0", "bottom": "e0", "
 # a straight bend line ACROSS the blank (disc L/U/Z, folded plates): flat part on one side, flange on the other
 FOLD_WORDS = ("fold", "fold_line", "line", "chord", "bend_line", "across", "offset", "middle", "center", "centre", "diameter_line", "")
 # flange all around a disc (round cover / cup), or around the bore of a ring (collar neck)
-RIM_WORDS = ("rim", "perimeter", "circumference", "outer", "outer_edge", "all_around", "around", "border", "periphery",
-             "outside", "edge", "outer_rim", "circular_edge", "round_edge", "skirt")
+# (generic words such as "edge" / "outer" are NOT rim words: "one edge bent up" on a disc is a fold)
+RIM_WORDS = ("rim", "perimeter", "circumference", "outer_edge", "all_around", "around", "periphery",
+             "outer_rim", "circular_edge", "round_edge", "skirt", "all_edges", "whole_edge", "full_perimeter")
 INNER_RIM_WORDS = ("inner_rim", "inner", "bore", "inner_edge", "hole", "inside", "neck", "collar", "spigot", "central_hole", "inner_circle")
 # straight edges of a half disc (arc 180) / quarter disc (arc 90)
 SECTOR_EDGE_ALIASES = {"y-": "y-", "diameter": "y-", "flat": "y-", "straight": "y-", "straight_edge": "y-", "flat_edge": "y-",
@@ -1672,6 +1673,10 @@ def _normalize_tube(ir):
         size = tb.get("size") or []
         width = tb.get("width") if tb.get("width") is not None else (tb.get("across") if tb.get("across") is not None else (size[0] if len(size) > 0 else None))
         prot = tb.get("protrusion") if tb.get("protrusion") is not None else (tb.get("length") if tb.get("length") is not None else (size[1] if len(size) > 1 else None))
+        if prot is None and width is not None:
+            # "tenon 20 mm" / "tenon 20x2 with a 2 mm wall": the one real number is how far it sticks out
+            prot, width = width, None
+            tb["protrusion_from_width"] = True
         tb["protrusion"] = _num(prot, "tab protrusion (length beyond the tube end)")
         tb["across"] = _num(width, "tab width across the face", allow_none=True)   # None -> full flat face width (builder)
         tb["across_defaulted"] = tb["across"] is None
